@@ -3,8 +3,8 @@ use core::fmt;
 use crate::gfx::color::{self, Color};
 use crate::gfx::fb::Framebuffer;
 
-const TITLE_BAR_H: usize = 26;
-const BORDER_W: usize = 1;
+pub const TITLE_BAR_H: usize = 26;
+pub const BORDER_W: usize = 1;
 
 /// Fixed-capacity stack string buffer for `no_std` formatting without heap allocation.
 pub struct StackBuf<const N: usize> {
@@ -20,7 +20,6 @@ impl<const N: usize> StackBuf<N> {
         }
     }
 
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -127,6 +126,20 @@ impl Window {
     pub fn client_origin(&self) -> (usize, usize) {
         (self.x + BORDER_W, self.y + TITLE_BAR_H + 1)
     }
+
+    pub fn hit_test(&self, px: usize, py: usize) -> bool {
+        px >= self.x
+            && px < self.x.saturating_add(self.w)
+            && py >= self.y
+            && py < self.y.saturating_add(self.h)
+    }
+
+    pub fn title_bar_hit_test(&self, px: usize, py: usize) -> bool {
+        px >= self.x
+            && px < self.x.saturating_add(self.w)
+            && py >= self.y
+            && py < self.y.saturating_add(TITLE_BAR_H)
+    }
 }
 
 fn draw_dot(fb: &mut Framebuffer, x: usize, y: usize, col: Color) {
@@ -205,6 +218,10 @@ impl CursorLayer {
         }
     }
 
+    pub fn position(&self) -> (usize, usize) {
+        (self.saved_x, self.saved_y)
+    }
+
     pub fn save_and_draw(&mut self, fb: &mut Framebuffer, x: usize, y: usize) {
         self.saved_x = x;
         self.saved_y = y;
@@ -213,18 +230,20 @@ impl CursorLayer {
         for (row, pattern) in CURSOR_BITMAP.iter().enumerate() {
             let py = y.saturating_add(row);
             for (col, &pixel) in pattern.iter().enumerate() {
-                let px = x.saturating_add(col);
-                self.saved_bg[row * CURSOR_W + col] = fb.get_pixel_raw(px, py);
-                match pixel {
-                    1 => fb.put_pixel(px, py, color::CURSOR_OUTLINE),
-                    2 => fb.put_pixel(px, py, color::CURSOR_FILL),
-                    _ => {}
+                if pixel != 0 {
+                    let px = x.saturating_add(col);
+                    self.saved_bg[row * CURSOR_W + col] = fb.get_pixel_raw(px, py);
+                    let col_val = if pixel == 1 {
+                        color::CURSOR_OUTLINE
+                    } else {
+                        color::CURSOR_FILL
+                    };
+                    fb.put_pixel(px, py, col_val);
                 }
             }
         }
     }
 
-    #[allow(dead_code)]
     pub fn restore(&mut self, fb: &mut Framebuffer) {
         if !self.has_saved {
             return;

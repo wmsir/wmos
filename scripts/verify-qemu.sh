@@ -99,28 +99,50 @@ import socket
 import time
 
 sock_path = "/tmp/wmos-mon.sock"
+uefi_log_path = "dist/qemu-uefi.log"
+
+def recv_until_prompt(sock: socket.socket, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    buf = b""
+    while time.monotonic() < deadline:
+        try:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"(qemu)" in buf:
+                break
+        except OSError:
+            break
+
+def send_mon(sock: socket.socket, cmd: bytes) -> None:
+    sock.sendall(cmd + b"\n")
+    recv_until_prompt(sock, timeout=2.0)
+
 if os.path.exists(sock_path):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(3.0)
+        s.settimeout(2.0)
         s.connect(sock_path)
         time.sleep(0.2)
-        try:
-            s.recv(4096)
-        except OSError:
-            pass
-        s.sendall(b"screendump dist/boot-preview.ppm\n")
+        recv_until_prompt(s, timeout=1.0)
+
+        send_mon(s, b"mouse_move 40 25")
+        time.sleep(0.08)
+
+        for key in (b"h", b"e", b"l", b"p", b"ret"):
+            send_mon(s, b"sendkey " + key)
+            time.sleep(0.08)
+
         deadline = time.monotonic() + 3.0
-        buf = b""
         while time.monotonic() < deadline:
-            try:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                if b"(qemu)" in buf:
-                    break
-            except OSError:
-                break
+            if os.path.exists(uefi_log_path):
+                with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
+                    if "[wmos] cmd: help" in lf.read():
+                        break
+            time.sleep(0.1)
+
+        time.sleep(0.2)
+        send_mon(s, b"screendump dist/boot-preview.ppm")
 PY
 fi
 
@@ -222,9 +244,18 @@ assert_log() {
         echo "ERROR: ${mode} log contains '[wmos] PANIC'" >&2
         exit 1
     fi
+    if grep -qF "[wmos] EXCEPTION" "${log_file}"; then
+        echo "ERROR: ${mode} log contains '[wmos] EXCEPTION'" >&2
+        exit 1
+    fi
 
     local required_markers=(
         "[wmos] boot ok"
+        "[wmos] gdt+tss ok"
+        "[wmos] idt+pic ok"
+        "[wmos] pmm ok"
+        "[wmos] vmm self-test ok"
+        "[wmos] pit+ps2 ok"
         "[wmos] fb="
         "[wmos] desktop rendered"
         "[wmos] ready"
@@ -240,9 +271,16 @@ assert_log() {
 assert_log "dist/qemu-bios.log" "BIOS"
 assert_log "dist/qemu-uefi.log" "UEFI"
 
+for uefi_marker in "[wmos] mouse active" "[wmos] cmd: help"; do
+    if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
+        echo "ERROR: UEFI log missing interactive marker: ${uefi_marker}" >&2
+        exit 1
+    fi
+done
+
 echo "=== Verification Summary ==="
-echo "BIOS log: PASSED (all required markers present, no PANIC)"
-echo "UEFI log: PASSED (all required markers present, no PANIC)"
+echo "BIOS log: PASSED (all required markers present, no PANIC/EXCEPTION)"
+echo "UEFI log: PASSED (all required + interactive markers present, no PANIC/EXCEPTION)"
 if [[ -f dist/boot-preview.png ]]; then
     echo "Preview PNG: dist/boot-preview.png generated"
 else

@@ -71,7 +71,6 @@ impl Framebuffer {
         }
     }
 
-    #[allow(dead_code)]
     pub fn get_pixel_raw(&self, x: usize, y: usize) -> u32 {
         let Some(offset) = self.pixel_offset(x, y) else {
             return 0;
@@ -135,16 +134,18 @@ impl Framebuffer {
         }
     }
 
-    pub fn fill_gradient_v(
+    fn fill_gradient_rows(
         &mut self,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
+        rx: usize,
+        ry: usize,
+        rw: usize,
+        rh: usize,
+        grad_y0: usize,
+        grad_h: usize,
         top: Color,
         bottom: Color,
     ) {
-        if self.info.addr.is_null() || w == 0 || h == 0 {
+        if self.info.addr.is_null() || rw == 0 || rh == 0 || grad_h == 0 {
             return;
         }
         let bpp_bytes = match self.info.bpp {
@@ -152,14 +153,14 @@ impl Framebuffer {
             24 => 3usize,
             _ => return,
         };
-        let x_end = x.saturating_add(w).min(self.info.width);
-        let y_end = y.saturating_add(h).min(self.info.height);
-        if x >= x_end || y >= y_end {
+        let x_end = rx.saturating_add(rw).min(self.info.width);
+        let y_end = ry.saturating_add(rh).min(self.info.height);
+        if rx >= x_end || ry >= y_end {
             return;
         }
-        let denom = h.saturating_sub(1);
-        for py in y..y_end {
-            let num = py - y;
+        let denom = grad_h.saturating_sub(1);
+        for py in ry..y_end {
+            let num = py.saturating_sub(grad_y0).min(denom);
             let c = if denom == 0 {
                 top
             } else {
@@ -173,7 +174,7 @@ impl Framebuffer {
             let Some(row_base) = py.checked_mul(self.info.pitch) else {
                 break;
             };
-            for px in x..x_end {
+            for px in rx..x_end {
                 if let Some(offset) = px.checked_mul(bpp_bytes).and_then(|dx| row_base.checked_add(dx)) {
                     unsafe {
                         self.write_raw_at(offset, raw);
@@ -181,6 +182,35 @@ impl Framebuffer {
                 }
             }
         }
+    }
+
+    pub fn fill_gradient_v(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        top: Color,
+        bottom: Color,
+    ) {
+        self.fill_gradient_rows(x, y, w, h, y, h, top, bottom);
+    }
+
+    pub fn fill_gradient_v_region(
+        &mut self,
+        rx: usize,
+        ry: usize,
+        rw: usize,
+        rh: usize,
+        total_h: usize,
+        top: Color,
+        bottom: Color,
+    ) {
+        let clamped_end = ry.saturating_add(rh).min(total_h);
+        if ry >= clamped_end {
+            return;
+        }
+        self.fill_gradient_rows(rx, ry, rw, clamped_end - ry, 0, total_h, top, bottom);
     }
 
     pub fn draw_hline(&mut self, x: usize, y: usize, w: usize, color: Color) {
