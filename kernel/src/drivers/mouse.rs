@@ -52,13 +52,20 @@ pub fn set_bounds(width: usize, height: usize) {
 
 /// Handles PS/2 mouse IRQ12 by decoding 3-byte packets and updating clamped cursor coordinates.
 pub fn on_irq() {
+    let status = unsafe { inb(0x64) };
+    if (status & 0x21) != 0x21 {
+        return;
+    }
+
     let byte = unsafe { inb(0x60) };
     MOUSE_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let cycle = PACKET_CYCLE.load(Ordering::Relaxed);
     match cycle {
         0 => {
-            if (byte & 0x08) != 0 {
+            // Require always-1 sync bit (0x08) and no X/Y overflow bits (0xC0) so stale
+            // ACK bytes like 0xFA cannot hijack packet alignment.
+            if (byte & 0xC8) == 0x08 {
                 PACKET_BYTE0.store(byte, Ordering::Relaxed);
                 PACKET_CYCLE.store(1, Ordering::Relaxed);
             }

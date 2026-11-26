@@ -74,19 +74,19 @@ pub fn init() {
 
     // Read controller configuration byte
     send_cmd(0x20);
-    let mut cfg = if wait_output_full() {
+    let base_cfg = if wait_output_full() {
         unsafe { inb(PS2_DATA) }
     } else {
-        0x47
+        0x44
     };
 
-    // Enable IRQ1 (bit 0), IRQ12 (bit 1), Set-1 translation (bit 6), clear clock-disable (bits 4..5)
-    cfg = (cfg | 0x01 | 0x02 | 0x40) & !0x30;
-
+    // Keep IRQ1/IRQ12 disabled while enabling ports and configuring the mouse so
+    // command ACKs (0xFA) never latch a stale IRQ into the 8259 PIC before sti().
+    let init_cfg = (base_cfg | 0x40) & !0x33;
     send_cmd(0x60);
     if wait_input_clear() {
         unsafe {
-            outb(PS2_DATA, cfg);
+            outb(PS2_DATA, init_cfg);
         }
     }
 
@@ -94,9 +94,19 @@ pub fn init() {
     send_cmd(0xAE);
     send_cmd(0xA8);
 
-    // Configure mouse defaults and enable packet streaming
+    // Configure mouse defaults and enable packet streaming while IRQs are masked
     send_mouse_cmd(0xF6);
     send_mouse_cmd(0xF4);
+    flush();
+
+    // Now enable IRQ1 (bit 0) and IRQ12 (bit 1) in the 8042 controller configuration
+    let final_cfg = init_cfg | 0x03;
+    send_cmd(0x60);
+    if wait_input_clear() {
+        unsafe {
+            outb(PS2_DATA, final_cfg);
+        }
+    }
 
     flush();
 }

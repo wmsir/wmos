@@ -75,6 +75,11 @@ fn push_event(ev: KeyEvent) {
 
 /// Handles PS/2 keyboard IRQ1 by decoding Set 1 scancodes into [`KeyEvent`]s.
 pub fn on_irq() {
+    let status = unsafe { inb(0x64) };
+    if (status & 0x01) == 0 || (status & 0x20) != 0 {
+        return;
+    }
+
     let scancode = unsafe { inb(0x60) };
     KEY_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
