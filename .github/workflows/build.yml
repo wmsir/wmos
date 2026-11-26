@@ -1,0 +1,63 @@
+name: Build and Verify WMOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build and virtualization tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso mtools gdisk qemu-utils qemu-system-x86 ovmf build-essential python3
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "kernel -> target"
+
+      - name: Build wmos kernel
+        working-directory: kernel
+        run: cargo build --release
+
+      - name: Package bootable images
+        run: |
+          chmod +x scripts/build-images.sh scripts/verify-qemu.sh
+          ./scripts/build-images.sh
+
+      - name: Verify images in QEMU (BIOS and UEFI)
+        run: ./scripts/verify-qemu.sh
+
+      - name: Upload bootable disk images
+        uses: actions/upload-artifact@v4
+        with:
+          name: wmos-images
+          path: |
+            dist/wmos.iso
+            dist/wmos.img
+            dist/wmos.qcow2
+            dist/wmos.vmdk
+            dist/wmos.vhd
+            dist/SHA256SUMS.txt
+
+      - name: Upload CI logs and boot preview
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wmos-ci-logs-and-preview
+          if-no-files-found: ignore
+          path: |
+            dist/qemu-bios.log
+            dist/qemu-uefi.log
+            dist/boot-preview.png

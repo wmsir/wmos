@@ -1,0 +1,12 @@
+/kernel/target/
+/dist/
+/limine/
+/iso_root/
+*.iso
+*.img
+*.qcow2
+*.vmdk
+*.vhd
+*.ppm
+.DS_Store
+Thumbs.db
