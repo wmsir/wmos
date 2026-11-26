@@ -45,15 +45,17 @@ xorriso -as mkisofs \
 # Build bootable 64 MiB GPT FAT32 raw disk image (dist/wmos.img)
 rm -f dist/wmos.img
 dd if=/dev/zero bs=1M count=0 seek=64 of=dist/wmos.img
-sgdisk dist/wmos.img -n 1:2048 -t 1:ef00
-./limine/limine bios-install dist/wmos.img
+sgdisk dist/wmos.img \
+    -n 1:2048:4095 -t 1:ef02 \
+    -n 2:4096:+60M -t 2:ef00
+./limine/limine bios-install dist/wmos.img 1
 
-mformat -i dist/wmos.img@@1M -F ::
-mmd -i dist/wmos.img@@1M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
-mcopy -i dist/wmos.img@@1M "${KERNEL_BIN}" ::/boot/wmos-kernel
-mcopy -i dist/wmos.img@@1M boot/limine.conf ::/boot/limine/limine.conf
-mcopy -i dist/wmos.img@@1M limine/limine-bios.sys ::/boot/limine/
-mcopy -i dist/wmos.img@@1M limine/BOOTX64.EFI limine/BOOTIA32.EFI ::/EFI/BOOT/
+mformat -i dist/wmos.img@@2M -T 122880 -F ::
+mmd -i dist/wmos.img@@2M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
+mcopy -i dist/wmos.img@@2M "${KERNEL_BIN}" ::/boot/wmos-kernel
+mcopy -i dist/wmos.img@@2M boot/limine.conf ::/boot/limine/limine.conf
+mcopy -i dist/wmos.img@@2M limine/limine-bios.sys ::/boot/limine/
+mcopy -i dist/wmos.img@@2M limine/BOOTX64.EFI limine/BOOTIA32.EFI ::/EFI/BOOT/
 
 # Convert raw disk image to VM formats
 qemu-img convert -f raw -O qcow2 dist/wmos.img dist/wmos.qcow2
