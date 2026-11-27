@@ -38,6 +38,66 @@ fn pack_channel(val: u8, mask_size: u8, mask_shift: u8) -> u32 {
     scaled.checked_shl(mask_shift as u32).unwrap_or(0)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ThemePalette {
+    pub desktop_top: Color,
+    pub desktop_bottom: Color,
+    pub accent: Color,
+    pub accent_bright: Color,
+    pub title_active: Color,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Dark,
+    Ocean,
+    Amber,
+}
+
+impl Theme {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Ocean,
+            Self::Ocean => Self::Amber,
+            Self::Amber => Self::Dark,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Ocean => "Ocean",
+            Self::Amber => "Amber",
+        }
+    }
+
+    pub fn palette(self) -> ThemePalette {
+        match self {
+            Self::Dark => ThemePalette {
+                desktop_top: DESKTOP_TOP,
+                desktop_bottom: DESKTOP_BOTTOM,
+                accent: ACCENT,
+                accent_bright: ACCENT_BRIGHT,
+                title_active: WIN_TITLE_ACTIVE,
+            },
+            Self::Ocean => ThemePalette {
+                desktop_top: Color::rgb(8, 28, 44),
+                desktop_bottom: Color::rgb(14, 68, 96),
+                accent: Color::rgb(14, 165, 233),
+                accent_bright: Color::rgb(56, 189, 248),
+                title_active: Color::rgb(20, 60, 88),
+            },
+            Self::Amber => ThemePalette {
+                desktop_top: Color::rgb(34, 20, 14),
+                desktop_bottom: Color::rgb(78, 44, 22),
+                accent: Color::rgb(217, 119, 6),
+                accent_bright: Color::rgb(251, 191, 36),
+                title_active: Color::rgb(72, 46, 28),
+            },
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub const BLACK: Color = Color::rgb(0, 0, 0);
 #[allow(dead_code)]

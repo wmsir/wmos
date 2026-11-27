@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use crate::arch::io::{inb, io_wait, outb};
+use crate::arch::io::{inb, io_wait, outb, outw};
 
 #[repr(C, packed)]
 struct NullIdtr {
@@ -106,4 +106,15 @@ pub fn reboot() -> ! {
             options(nostack, noreturn)
         );
     }
+}
+
+/// Powers off the virtual machine via QEMU/Bochs/VirtualBox ACPI I/O ports, falling back to halt.
+pub fn shutdown() -> ! {
+    cli();
+    unsafe {
+        outw(0x604, 0x2000);
+        outw(0xB004, 0x2000);
+        outw(0x4004, 0x3400);
+    }
+    halt_loop();
 }

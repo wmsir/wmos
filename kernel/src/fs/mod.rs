@@ -1,3 +1,5 @@
+pub mod fat32;
+
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -6,8 +8,9 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::cpu;
+use crate::fs::fat32::Fat32Volume;
 
-/// Metadata for a file stored in the in-memory RAMFS.
+/// Metadata for a file stored in RAMFS or the read-only FAT32 disk mount.
 pub struct FileEntry {
     pub name: String,
     pub size: usize,
@@ -20,25 +23,30 @@ pub struct FsStats {
     pub total_bytes: usize,
 }
 
-struct FsLock {
+struct FsLock<T> {
     locked: AtomicBool,
-    inner: UnsafeCell<Option<BTreeMap<String, Vec<u8>>>>,
+    inner: UnsafeCell<T>,
 }
 
-unsafe impl Sync for FsLock {}
+unsafe impl<T> Sync for FsLock<T> {}
 
-static RAMFS: FsLock = FsLock {
+static RAMFS: FsLock<Option<BTreeMap<String, Vec<u8>>>> = FsLock {
     locked: AtomicBool::new(false),
     inner: UnsafeCell::new(None),
 };
 
-struct IrqGuard<'a> {
-    lock: &'a FsLock,
+static DISKFS: FsLock<Option<Fat32Volume>> = FsLock {
+    locked: AtomicBool::new(false),
+    inner: UnsafeCell::new(None),
+};
+
+struct IrqGuard<'a, T> {
+    lock: &'a FsLock<T>,
     saved_if: bool,
 }
 
-impl<'a> IrqGuard<'a> {
-    fn acquire(lock: &'a FsLock) -> Self {
+impl<'a, T> IrqGuard<'a, T> {
+    fn acquire(lock: &'a FsLock<T>) -> Self {
         let rflags: u64;
         unsafe {
             asm!("pushfq", "pop {}", out(reg) rflags, options(nomem, preserves_flags));
@@ -56,13 +64,12 @@ impl<'a> IrqGuard<'a> {
     }
 
     #[inline]
-    fn map_mut(&mut self) -> &mut BTreeMap<String, Vec<u8>> {
-        let slot = unsafe { &mut *self.lock.inner.get() };
-        slot.get_or_insert_with(BTreeMap::new)
+    fn inner_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.inner.get() }
     }
 }
 
-impl Drop for IrqGuard<'_> {
+impl<T> Drop for IrqGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
         if self.saved_if {
@@ -79,25 +86,30 @@ fn normalize_name(raw: &str) -> Result<String, &'static str> {
     Ok(String::from(trimmed))
 }
 
+#[inline]
+fn is_disk_path(norm: &str) -> bool {
+    norm == "disk" || norm.starts_with("disk/")
+}
+
 /// Initializes the RAMFS and seeds default files (`readme.txt`, `motd.txt`, `notes.txt`).
 pub fn init() {
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.clear();
 
     map.insert(
         String::from("readme.txt"),
         Vec::from(
-            &b"WMOS v2.0.0 In-Memory RAMFS\n\
-               Commands: ls, cat, write, append, touch, rm, stat, open <app>\n\
-               Apps: info, term, paint, notepad\n"[..],
+            &b"WMOS v3.0.0 In-Memory RAMFS + FAT32 Disk\n\
+               Commands: ls, cat, write, append, touch, rm, stat, disks, lspci, ps, open <app>\n\
+               Apps: info, term, paint, notepad, files\n"[..],
         ),
     );
     map.insert(
         String::from("motd.txt"),
         Vec::from(
-            &b"Welcome to WMOS v2.0.0 (x86_64 Rust no_std Micro-OS)!\n\
-               Heap allocator, CMOS RTC, double-buffered GUI, and RAMFS are online.\n"[..],
+            &b"Welcome to WMOS v3.0.0 (x86_64 Rust no_std Micro-OS)!\n\
+               PCI, AHCI SATA, FAT32 /disk/, Cooperative Scheduler, Heap, RTC, and RAMFS are online.\n"[..],
         ),
     );
     map.insert(
@@ -109,10 +121,41 @@ pub fn init() {
     );
 }
 
+/// Scans the AHCI SATA disk for a FAT32 partition and mounts its files under `disk/`.
+pub fn mount_fat32_disk() -> usize {
+    let vol = fat32::scan_disk();
+    let count = vol.as_ref().map_or(0, |v| v.files.len());
+    let mut guard = IrqGuard::acquire(&DISKFS);
+    *guard.inner_mut() = vol;
+    count
+}
+
+/// Returns `true` if a FAT32 disk partition is mounted under `disk/`.
+pub fn is_disk_mounted() -> bool {
+    let mut guard = IrqGuard::acquire(&DISKFS);
+    guard.inner_mut().is_some()
+}
+
+/// Returns all mounted read-only FAT32 files prefixed with `disk/`.
+pub fn list_disk() -> Vec<FileEntry> {
+    let mut guard = IrqGuard::acquire(&DISKFS);
+    match guard.inner_mut() {
+        Some(vol) => vol
+            .files
+            .iter()
+            .map(|f| FileEntry {
+                name: f.path.clone(),
+                size: f.size,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Returns all RAMFS entries sorted by filename.
 pub fn list() -> Vec<FileEntry> {
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.iter()
         .map(|(name, data)| FileEntry {
             name: name.clone(),
@@ -121,11 +164,18 @@ pub fn list() -> Vec<FileEntry> {
         .collect()
 }
 
-/// Reads the raw bytes of `name` if it exists.
+/// Reads the raw bytes of `name` from either the mounted FAT32 `disk/` or RAMFS.
 pub fn read(name: &str) -> Option<Vec<u8>> {
     let norm = normalize_name(name).ok()?;
+    if norm.starts_with("disk/") {
+        let mut guard = IrqGuard::acquire(&DISKFS);
+        let vol = guard.inner_mut().as_ref()?;
+        let rec = vol.files.iter().find(|f| f.path == norm)?;
+        return fat32::read_file(vol, rec);
+    }
+
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.get(&norm).cloned()
 }
 
@@ -138,39 +188,51 @@ pub fn read_to_string(name: &str) -> Option<String> {
     })
 }
 
-/// Writes `data` to `name`, creating or overwriting the file.
+/// Writes `data` to `name` in RAMFS (rejecting read-only `disk/` paths).
 pub fn write(name: &str, data: &[u8]) -> Result<usize, &'static str> {
     let norm = normalize_name(name)?;
+    if is_disk_path(&norm) {
+        return Err("Disk mount is read-only");
+    }
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.insert(norm, data.to_vec());
     Ok(data.len())
 }
 
-/// Appends `data` to `name`, creating the file if it does not exist.
+/// Appends `data` to `name` in RAMFS (rejecting read-only `disk/` paths).
 pub fn append(name: &str, data: &[u8]) -> Result<usize, &'static str> {
     let norm = normalize_name(name)?;
+    if is_disk_path(&norm) {
+        return Err("Disk mount is read-only");
+    }
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     let buf = map.entry(norm).or_default();
     buf.extend_from_slice(data);
     Ok(data.len())
 }
 
-/// Creates an empty file at `name` if it does not already exist.
+/// Creates an empty file at `name` in RAMFS (rejecting read-only `disk/` paths).
 pub fn touch(name: &str) -> Result<(), &'static str> {
     let norm = normalize_name(name)?;
+    if is_disk_path(&norm) {
+        return Err("Disk mount is read-only");
+    }
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.entry(norm).or_default();
     Ok(())
 }
 
-/// Removes `name` from the RAMFS.
+/// Removes `name` from RAMFS (rejecting read-only `disk/` paths).
 pub fn remove(name: &str) -> Result<(), &'static str> {
     let norm = normalize_name(name)?;
+    if is_disk_path(&norm) {
+        return Err("Disk mount is read-only");
+    }
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     if map.remove(&norm).is_some() {
         Ok(())
     } else {
@@ -181,7 +243,7 @@ pub fn remove(name: &str) -> Result<(), &'static str> {
 /// Returns total file count and byte usage across the RAMFS.
 pub fn stats() -> FsStats {
     let mut guard = IrqGuard::acquire(&RAMFS);
-    let map = guard.map_mut();
+    let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     let total_bytes = map.values().map(|v| v.len()).sum();
     FsStats {
         file_count: map.len(),

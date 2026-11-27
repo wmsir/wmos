@@ -1,6 +1,6 @@
-# WMOS (`v2.0.0`) — x86_64 Rust Micro-OS
+# WMOS (`v3.0.0`) — x86_64 Rust Micro-OS
 
-基于 Rust (`#![no_std]`, 100% Stable, `alloc`) 与 Limine 引导协议构建的独立 x86_64 微内核桌面操作系统，集成了硬件中断、PMM/VMM/内核堆、CMOS RTC 时钟、内存文件系统 RAMFS、PS/2 键鼠交互、RAM 双缓冲窗口桌面（`System Info` / `WMOS Terminal` / `WMOS Paint` / `WMOS Notepad`）以及无头 QEMU BIOS/UEFI 全自动 CI 打包与交互验证。
+基于 Rust (`#![no_std]`, 100% Stable, `alloc`) 与 Limine 引导协议构建的独立 `x86_64` 微内核桌面操作系统，集成了 PCI 总线枚举、AHCI SATA DMA 磁盘驱动、GPT FAT32 `/disk/` 只读挂载、3 任务协作式调度器、PMM/VMM/内核堆、CMOS RTC、RAMFS、双缓冲多主题桌面（`System Info` / `WMOS Terminal` / `WMOS Paint` / `WMOS Notepad` / `WMOS Files`）、ACPI 关机以及无头 QEMU BIOS/UEFI + SATA 磁盘全自动 CI 验证。
 
 GitHub 仓库：`https://github.com/wmsir/wmos`
 
@@ -10,34 +10,29 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 
 > **强制同步原则**：任何代码、配置、脚本或 CI 工作流变更，**必须在同一次提交中同步更新文档**，确保文档与实现 100% 一致。
 
-- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、高半核链接与 HHDM/PMM/VMM/Heap 内存布局、启动时序与串口契约、核心子系统设计、镜像构建及 QEMU 校验体系
+- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、内存/MMIO 映射、启动时序与串口契约、PCI/AHCI/FAT32/调度器/GUI 子系统设计、镜像构建及 QEMU 校验体系
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — 版本里程碑与每次变更的代码级追踪记录
 - **[AGENTS.md](AGENTS.md)** — 强制文档同步规则、Rust Stable `#![no_std]` 内核约束与 `.sh` 纯 LF 行尾规范
 
 ---
 
-## 核心特性（`v2.0.0`）
+## 核心特性（`v3.0.0`）
 
-- **引导与架构初始化**：
-  - Limine v10 高半核 ELF64 引导（`0xffffffff80000000`），解析 HHDM、物理内存映射与线性帧缓冲（Framebuffer）。
-  - **64 位 GDT / TSS**：配置内核代码/数据段与 16 字节 TSS 描述符，并为 Double Fault（`#DF`，向量 8）分配独立 16 KiB IST1 栈。
-  - **IDT 与 8259 PIC**：256 项中断描述符表 + 汇编 `global_asm!` 入口桩，重映射主/从 8259 PIC（`0x20` / `0x28`），开启 IRQ0（PIT 100 Hz）、IRQ1（键盘）、IRQ2（级联）与 IRQ12（鼠标）。
-  - **CMOS RTC 实时时钟**：通过 `0x70`/`0x71` 端口读取真实日期时间（含 UIP 等待、双读校验及 BCD/12h 解码）。
-- **内存管理与动态堆**：
-  - **PMM（物理页框分配器）**：128 KiB 4 KiB 页帧位图（最高 4 GiB）。
-  - **VMM（4 级页表虚拟内存）**：支持 `map_page` / `unmap_page` / `translate` 与开机写入自检（`[wmos] vmm self-test ok`）。
-  - **内核堆（`#[global_allocator]`）**：在 `0xFFFF_A000_0000_0000` 动态映射 `2 MiB .. 16 MiB`，采用地址有序合并式自由链表支持 `alloc`（`Box`/`Vec`/`String`/`BTreeMap`）。
-- **内存文件系统（RAMFS）**：
-  - 基于 `BTreeMap` 的内核态内存文件系统，开机预置 `readme.txt`、`motd.txt`、`notes.txt` 并执行读写删自检（`[wmos] fs ok`）。
-- **双缓冲桌面、内置应用与交互终端**：
-  - **RAM 双缓冲渲染**：32/24bpp 后备帧缓存配合 `present_rect` / `present_all` 局部刷新 MMIO 显存，叠加 `12x16` 防残影指针图层。
-  - **多窗口桌面与 Start 菜单**：支持 4 个窗口（`System Info`、`WMOS Terminal`、`WMOS Paint`、`WMOS Notepad`）拖拽、标题栏红/黄/绿三按钮（关闭/最小化/重置）、Start 菜单启动/重启、任务栏标签切换以及右下角实时 CMOS RTC 时钟与光标坐标托盘。
-  - **内置 GUI 应用**：
-    - `WMOS Paint`：360×220 画布、6 种色板、`[S]`/`[L]` 笔刷切换、`Clear` 与 Bresenham 连续绘制/右键擦除。
-    - `WMOS Notepad`：绑定 RAMFS `notes.txt`，支持键盘编辑与 `Load`/`Save`/`Clear` 工具栏操作。
-  - **升级版 `WMOS Terminal`**：支持 `Up`/`Down` 64 条命令历史、`Left`/`Right` 行内编辑与 `Tab` 自动补全，内置 17 条命令：
-    - 系统与信息：`help`、`info`、`mem`、`date`、`uptime`、`open <info|term|paint|notepad>`、`echo <text>`、`clear`、`about`、`reboot`
-    - RAMFS 文件操作：`ls`、`cat <file>`、`write <file> <text>`、`append <file> <text>`、`touch <file>`、`rm <file>`、`stat <file>`
+- **引导、架构与调度**：
+  - Limine v10 高半核 ELF64 引导（`0xffffffff80000000`），解析 HHDM、物理内存映射与线性帧缓冲。
+  - **64 位 GDT / TSS / IDT / 8259 PIC / 100 Hz PIT**：IST1 独立 16 KiB `#DF` 栈，汇编 `global_asm!` 15 寄存器中断桩。
+  - **CMOS RTC & ACPI 电源管理**：读取 `0x70`/`0x71` 实时时钟；支持 PS/2 `reboot` 与 QEMU/Bochs/VirtualBox ACPI I/O 端口 `shutdown`。
+  - **协作式多任务调度器**：基于 `global_asm!` `switch_context` 运行 3 个 16 KiB 栈内核任务（`desktop-ui`、`sys-monitor`、`idle-worker`）。
+- **内存管理与存储**：
+  - **PMM / VMM / Kernel Heap**：4 KiB 位图 PMM（最高 4 GiB）、4 级页表 VMM（支持 `WRITE_THROUGH` / `CACHE_DISABLE` MMIO 映射）与 `0xFFFF_A000_0000_0000` 合并式全局堆。
+  - **PCI + AHCI SATA DMA + GPT FAT32 `/disk/`**：扫描 PCI 总线 `0..=7`，通过 AHCI `IDENTIFY` 与 `READ_DMA_EXT` 读取 SATA 磁盘，解析 GPT `ef00` 分区与 FAT32 长/短文件名并只读挂载至 `/disk/`，与可读写 RAMFS（`readme.txt`、`motd.txt`、`notes.txt`）统一访问。
+- **双缓冲多主题桌面与 22 命令终端**：
+  - **5 窗口与 3 套主题**：支持 `Dark` / `Ocean` / `Amber` 实时切换，集成 `System Info`、`WMOS Terminal`、`WMOS Paint`、`WMOS Notepad`（支持只读查看 `/disk/` 文件）与 `WMOS Files`（浏览 RAMFS 与 FAT32 `/disk/` 并一键打开至 Notepad）。
+  - **8 项 Start 菜单与动态任务栏**：支持窗口关闭/最小化/重置、动态防遮挡任务栏标签及右下角 CMOS RTC 时钟与光标托盘。
+  - **`WMOS Terminal`（22 条命令 + 历史 + Tab 补全）**：
+    - 系统与硬件：`help`、`info`、`mem`、`date`、`uptime`、`lspci`、`ps`、`disks`、`theme <dark|ocean|amber>`、`reboot`、`poweroff`
+    - 存储与文件：`ls [/disk]`、`cat <file>`（支持 `/disk/<path>`）、`write <file> <text>`、`append <file> <text>`、`touch <file>`、`rm <file>`、`stat <file>`
+    - 应用与工具：`open <info|term|paint|notepad|files>`、`open notepad <file>`、`echo <text>`、`clear`、`about`
 
 ---
 
@@ -58,28 +53,29 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 │   └── CHANGELOG.md              # 版本与变更追踪日志
 ├── scripts/
 │   ├── build-images.sh           # 生成 ISO / RAW / QCOW2 / VMDK / VHD 与 SHA256SUMS.txt
-│   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI 启动断言、键鼠与终端命令注入及截图导出
+│   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI（含 SATA 磁盘）断言、命令注入与截图导出
 └── kernel/
     ├── .cargo/config.toml        # x86_64-unknown-none 静态内核编译参数
     ├── Cargo.toml                # wmos-kernel crate 配置（依赖 limine 0.5）
     ├── build.rs                  # 传入 linker-x86_64.ld 链接脚本
     ├── linker-x86_64.ld          # 高半核 (0xffffffff80000000) ELF64 链接脚本
     └── src/
-        ├── main.rs               # extern crate alloc、kmain 初始化与低功耗中断事件循环
+        ├── main.rs               # kmain 初始化、调度主循环与 panic_handler
         ├── boot_info.rs          # BootSummary / FramebufferInfo 引导信息抽象
-        ├── shell.rs              # WMOS Terminal（17 条命令、历史记录、Tab 补全）
-        ├── fs/                   # 内存文件系统 RAMFS（BTreeMap）
+        ├── shell.rs              # WMOS Terminal（22 条命令、历史记录、/disk/ Tab 补全）
+        ├── task/mod.rs           # 3 任务协作式调度器与 global_asm! 上下文切换
+        ├── fs/                   # 统一文件系统（RAMFS + fat32.rs GPT FAT32 只读驱动）
         ├── arch/                 # x86_64 架构支持（cpu、io、serial、gdt、pic、pit、rtc、idt）
         ├── mem/                  # 内存管理（pmm 位图、vmm 4 级页表、heap 全局分配器）
-        ├── drivers/              # 设备驱动（ps2 控制器、keyboard、mouse）
-        └── gfx/                  # 字体、双缓冲 Framebuffer、Window/CursorLayer、Paint/Notepad 与桌面管理
+        ├── drivers/              # 设备驱动（pci、ahci SATA DMA、ps2、keyboard、mouse）
+        └── gfx/                  # 字体、主题色板、双缓冲 Framebuffer、Paint/Notepad/Files 与桌面管理
 ```
 
 ---
 
 ## 下载 GitHub Actions 构建产物
 
-每次推送到 `https://github.com/wmsir/wmos` 的 `main` 分支都会自动触发 **Build and Verify WMOS** 工作流，执行编译、镜像打包以及 QEMU Legacy BIOS / UEFI 双模式交互验证：
+每次推送到 `https://github.com/wmsir/wmos` 的 `main` 分支都会自动触发 **Build and Verify WMOS** 工作流，执行编译、镜像打包以及 QEMU Legacy BIOS / UEFI（含真实 SATA 盘 FAT32 挂载）双模式交互验证：
 
 1. 打开仓库页面：https://github.com/wmsir/wmos/actions
 2. 选择最近一次绿色的 **Build and Verify WMOS** 运行记录；
@@ -93,8 +89,8 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
      - `SHA256SUMS.txt` — 所有镜像的 SHA-256 校验值
    - **`wmos-ci-logs-and-preview`**：包含 CI 验证日志与实时截图：
      - `qemu-bios.log` — QEMU Legacy BIOS 串口启动日志
-     - `qemu-uefi.log` — QEMU UEFI (OVMF) 串口启动、键鼠与终端命令交互日志
-     - `boot-preview.png` — UEFI 模式下自动执行 `ls`/`write`/`cat`/`date`/`open paint` 后的实时桌面截图
+     - `qemu-uefi.log` — QEMU UEFI (OVMF) + AHCI SATA 串口启动及交互日志
+     - `boot-preview.png` — UEFI 模式下自动执行 `lspci`/`ps`/`disks`/`cat /disk/boot/limine/limine.conf`/`write`/`cat`/`open files` 后的实时桌面截图
 
 ---
 
@@ -102,22 +98,22 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 
 ### 1. QEMU（推荐）
 
+#### 运行 `.iso` + 挂载 SATA FAT32 磁盘（UEFI OVMF 模式，完整体验 `/disk/`）
+```bash
+# Linux（固件路径常见为 /usr/share/OVMF/OVMF_CODE_4M.fd 或 /usr/share/OVMF/OVMF_CODE.fd）
+qemu-system-x86_64 -M q35 -m 256M \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+  -cdrom wmos.iso -drive file=wmos.img,format=raw -vga std -serial stdio
+```
+
 #### 运行 `.iso`（Legacy BIOS 模式）
 ```bash
 qemu-system-x86_64 -M q35 -m 256M -cdrom wmos.iso -boot d -serial stdio
 ```
 
-#### 运行 `.iso`（UEFI OVMF 模式）
-```bash
-# Linux（固件路径常见为 /usr/share/OVMF/OVMF_CODE_4M.fd 或 /usr/share/OVMF/OVMF_CODE.fd）
-qemu-system-x86_64 -M q35 -m 256M \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-  -cdrom wmos.iso -vga std -serial stdio
-```
-
 #### 运行 `.img` / `.qcow2` 磁盘镜像
 ```bash
-# RAW 磁盘镜像
+# RAW 磁盘镜像（自带 GPT FAT32 分区，可直接在系统内挂载为 /disk/）
 qemu-system-x86_64 -M q35 -m 256M -drive file=wmos.img,format=raw -serial stdio
 
 # QCOW2 磁盘镜像（BIOS 或配合上方 OVMF 参数以 UEFI 启动）
@@ -128,10 +124,10 @@ qemu-system-x86_64 -M q35 -m 256M -drive file=wmos.qcow2,format=qcow2 -serial st
 
 - **方式 A（使用 `wmos.iso`）**：
   1. 新建虚拟机，类型选择 `Other`，版本选择 `Other/Unknown (64-bit)`，内存分配 `256 MB` 以上；
-  2. 在 **设置 -> 存储** 中将 `wmos.iso` 挂载到光驱；
+  2. 在 **设置 -> 存储** 中将 `wmos.iso` 挂载到光驱；若同时挂载 `wmos.vhd` 到 SATA 控制器，可在系统内通过 `WMOS Files` 或 `/disk/` 浏览磁盘文件；
   3. BIOS 与 EFI 模式均支持（可在 **设置 -> 系统 -> 启用 EFI** 切换）。
 - **方式 B（使用 `wmos.vhd`）**：
-  1. 新建虚拟机时选择 **使用已有的虚拟硬盘文件**，选中 `wmos.vhd`；
+  1. 新建虚拟机时选择 **使用已有的虚拟硬盘文件**，选中 `wmos.vhd`（推荐挂载在 AHCI SATA 控制器下）；
   2. 如需 UEFI 启动，勾选 **设置 -> 系统 -> 启用 EFI (仅限特殊操作系统)**。
 
 ### 3. VMware Workstation / Player / Fusion
@@ -140,7 +136,7 @@ qemu-system-x86_64 -M q35 -m 256M -drive file=wmos.qcow2,format=qcow2 -serial st
   1. 创建新虚拟机（选择“稍后安装操作系统”），客户机类型选 `Other -> Other 64-bit`；
   2. 在虚拟机设置中将 CD/DVD 指向 `wmos.iso` 并启动。
 - **方式 B（使用 `wmos.vmdk`）**：
-  1. 创建自定义虚拟机，在“选择磁盘”步骤选择 **使用现有虚拟磁盘**，指定 `wmos.vmdk`；
+  1. 创建自定义虚拟机，在“选择磁盘”步骤选择 **使用现有虚拟磁盘**（建议选 SATA 控制器），指定 `wmos.vmdk`；
   2. 在 **虚拟机设置 -> 选项 -> 高级** 中可自由选择 **BIOS** 或 **UEFI** 固件类型。
 
 ---
@@ -156,7 +152,7 @@ sudo apt-get update && sudo apt-get install -y \
 rustup target add x86_64-unknown-none
 (cd kernel && cargo build --release)
 
-# 打包镜像并运行 QEMU 双模式与交互验证
+# 打包镜像并运行 QEMU 双模式与 SATA 磁盘交互验证
 chmod +x scripts/build-images.sh scripts/verify-qemu.sh
 ./scripts/build-images.sh
 ./scripts/verify-qemu.sh

@@ -5,10 +5,11 @@ use alloc::vec::Vec;
 use crate::arch::{cpu, pit, rtc};
 use crate::boot_info::BootSummary;
 use crate::drivers::keyboard::{self, KeyEvent};
-use crate::drivers::mouse;
+use crate::drivers::{ahci, mouse, pci};
 use crate::fs;
-use crate::gfx::color::{self, Color};
+use crate::gfx::color::{self, Color, Theme};
 use crate::mem::{heap, pmm, vmm};
+use crate::task::{self, TaskState};
 
 const MAX_LINES: usize = 64;
 const MAX_HISTORY: usize = 64;
@@ -16,17 +17,21 @@ const MAX_INPUT_LEN: usize = 96;
 const MIB: u64 = 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
-const COMMANDS: [&str; 17] = [
+const COMMANDS: [&str; 22] = [
     "help", "info", "mem", "date", "uptime", "ls", "cat", "write", "append", "touch", "rm",
-    "stat", "open", "echo", "clear", "about", "reboot",
+    "stat", "open", "lspci", "ps", "disks", "theme", "echo", "clear", "about", "reboot",
+    "poweroff",
 ];
 
-const APP_NAMES: [&str; 4] = ["info", "term", "paint", "notepad"];
+const APP_NAMES: [&str; 5] = ["info", "term", "paint", "notepad", "files"];
+const THEME_NAMES: [&str; 3] = ["dark", "ocean", "amber"];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ShellAction {
     None,
     OpenApp(usize),
+    OpenInNotepad(String),
+    SetTheme(Theme),
 }
 
 struct TermLine {
@@ -57,7 +62,7 @@ impl TerminalState {
         term.push_line("[wmos] boot ok", color::TERM_GREEN);
         if vmm_ok {
             term.push_line(
-                "[wmos] gdt+tss/idt+pic/pmm/vmm/heap/rtc/fs/pit+ps2 ok",
+                "[wmos] gdt/idt/pmm/vmm/heap/pci/ahci/sched ok",
                 color::TERM_GREEN,
             );
         } else {
@@ -77,7 +82,12 @@ impl TerminalState {
             ),
             color::TERM_CYAN,
         );
-        term.push_line("[wmos] desktop rendered", color::TERM_GREEN);
+        if fs::is_disk_mounted() {
+            term.push_line(
+                &format!("[wmos] /disk/ FAT32 mounted ({} files)", fs::list_disk().len()),
+                color::TERM_CYAN,
+            );
+        }
         term.push_line("Type 'help' for commands.", color::TERM_AMBER);
         term
     }
@@ -216,6 +226,8 @@ impl TerminalState {
         if let Some((first, rest)) = trimmed.split_once(' ') {
             if !rest.contains(' ') {
                 let prefix = rest;
+                let has_leading_slash = prefix.starts_with('/');
+                let clean_prefix = prefix.trim_start_matches('/');
                 let mut candidates: Vec<String> = Vec::new();
                 if first == "open" {
                     for &app in &APP_NAMES {
@@ -223,10 +235,25 @@ impl TerminalState {
                             candidates.push(String::from(app));
                         }
                     }
+                } else if first == "theme" {
+                    for &th in &THEME_NAMES {
+                        if th.starts_with(prefix) {
+                            candidates.push(String::from(th));
+                        }
+                    }
                 } else {
                     for entry in fs::list() {
-                        if entry.name.starts_with(prefix) {
+                        if entry.name.starts_with(clean_prefix) {
                             candidates.push(entry.name);
+                        }
+                    }
+                    for entry in fs::list_disk() {
+                        if entry.name.starts_with(clean_prefix) {
+                            if has_leading_slash {
+                                candidates.push(format!("/{}", entry.name));
+                            } else {
+                                candidates.push(entry.name);
+                            }
                         }
                     }
                 }
@@ -262,20 +289,20 @@ impl TerminalState {
     fn execute_command(&mut self, cmd: &str, summary: &BootSummary) -> ShellAction {
         if cmd == "help" {
             self.push_line(
-                "Sys: help, info, mem, date, uptime, open <app>, clear, about, reboot",
+                "Sys : help, info, mem, date, uptime, lspci, ps, disks, theme, reboot, poweroff",
                 color::TERM_CYAN,
             );
             self.push_line(
-                "FS : ls, cat <f>, write <f> <txt>, append <f> <txt>, touch <f>, rm <f>, stat <f>",
+                "FS  : ls [/disk], cat <f>, write <f> <t>, append <f> <t>, touch/rm/stat <f>",
                 color::TERM_GREEN,
             );
             self.push_line(
-                "App: open info | term | paint | notepad   (Tab/Up/Down supported)",
+                "Apps: open <info|term|paint|notepad|files>, echo, clear, about",
                 color::TEXT_MUTED,
             );
         } else if cmd == "info" {
             self.push_line(
-                "OS: wmos v2.0.0 | Arch: x86_64 (Rust no_std)",
+                "OS: wmos v3.0.0 | Arch: x86_64 (Rust no_std)",
                 color::TEXT_PRIMARY,
             );
             self.push_line(
@@ -353,27 +380,123 @@ impl TerminalState {
                 ),
                 color::TEXT_PRIMARY,
             );
-        } else if cmd == "ls" {
-            let entries = fs::list();
-            let st = fs::stats();
-            if entries.is_empty() {
-                self.push_line("(empty ramfs)", color::TEXT_MUTED);
+        } else if cmd == "lspci" {
+            let devs = pci::devices();
+            if devs.is_empty() {
+                self.push_line("No PCI devices detected", color::TEXT_MUTED);
             } else {
-                for entry in entries {
+                for d in &devs {
                     self.push_line(
-                        &format!("  {:16} {} B", entry.name, entry.size),
+                        &format!(
+                            "{:02x}:{:02x}.{} {:04x}:{:04x} [{}] {}",
+                            d.bus,
+                            d.device,
+                            d.function,
+                            d.vendor_id,
+                            d.device_id,
+                            pci::vendor_name(d.vendor_id),
+                            pci::class_name(d.class_code, d.subclass)
+                        ),
                         color::TEXT_PRIMARY,
                     );
                 }
+                self.push_line(&format!("{} PCI device(s)", devs.len()), color::TERM_CYAN);
+            }
+        } else if cmd == "ps" {
+            let tasks = task::list();
+            self.push_line("ID | STATE   | SWITCHES | TICKS    | NAME", color::TERM_CYAN);
+            for t in &tasks {
+                let st = match t.state {
+                    TaskState::Running => "Running",
+                    TaskState::Ready => "Ready  ",
+                };
                 self.push_line(
-                    &format!("{} files, {} bytes total", st.file_count, st.total_bytes),
-                    color::TERM_CYAN,
+                    &format!(
+                        "{:<2} | {} | {:<8} | {:<8} | {}",
+                        t.id, st, t.switches, t.ticks, t.name
+                    ),
+                    color::TEXT_PRIMARY,
                 );
             }
+            self.push_line(
+                &format!("Total context switches: {}", task::total_switches()),
+                color::TERM_GREEN,
+            );
+        } else if cmd == "disks" {
+            match ahci::disk_info() {
+                Some(d) => {
+                    let kib = (d.sectors.saturating_mul(512)) / 1024;
+                    self.push_line(
+                        &format!(
+                            "AHCI Port {}: {} ({} sectors, {} KiB)",
+                            d.port,
+                            d.model_str(),
+                            d.sectors,
+                            kib
+                        ),
+                        color::TERM_GREEN,
+                    );
+                }
+                None => {
+                    self.push_line("AHCI Disk: none detected", color::TEXT_MUTED);
+                }
+            }
+            if fs::is_disk_mounted() {
+                self.push_line(
+                    &format!("FAT32 /disk/: mounted ({} files)", fs::list_disk().len()),
+                    color::TERM_CYAN,
+                );
+            } else {
+                self.push_line("FAT32 /disk/: not mounted", color::TERM_AMBER);
+            }
+        } else if cmd == "ls" || cmd == "ls /disk" || cmd == "ls disk" || cmd == "ls /disk/" {
+            if cmd != "ls" {
+                let disk_entries = fs::list_disk();
+                if disk_entries.is_empty() {
+                    self.push_line("/disk/ not mounted or empty", color::TEXT_MUTED);
+                } else {
+                    for entry in &disk_entries {
+                        self.push_line(
+                            &format!("  {:32} {} B", entry.name, entry.size),
+                            color::TEXT_PRIMARY,
+                        );
+                    }
+                    self.push_line(
+                        &format!("{} file(s) on FAT32 /disk/", disk_entries.len()),
+                        color::TERM_CYAN,
+                    );
+                }
+            } else {
+                let entries = fs::list();
+                let st = fs::stats();
+                for entry in entries {
+                    self.push_line(
+                        &format!("  {:18} {} B", entry.name, entry.size),
+                        color::TEXT_PRIMARY,
+                    );
+                }
+                if fs::is_disk_mounted() {
+                    self.push_line(
+                        &format!(
+                            "RAMFS: {} files ({} B) | FAT32 /disk/: {} files ('ls /disk')",
+                            st.file_count,
+                            st.total_bytes,
+                            fs::list_disk().len()
+                        ),
+                        color::TERM_CYAN,
+                    );
+                } else {
+                    self.push_line(
+                        &format!("{} files, {} bytes total", st.file_count, st.total_bytes),
+                        color::TERM_CYAN,
+                    );
+                }
+            }
         } else if let Some(arg) = cmd.strip_prefix("cat ") {
-            let name = arg.trim();
-            if let Some(content) = fs::read_to_string(name) {
-                crate::serial_println!("[wmos] fs cat {} ok", name);
+            let raw_name = arg.trim();
+            let norm = raw_name.trim_start_matches('/');
+            if let Some(content) = fs::read_to_string(raw_name) {
+                crate::serial_println!("[wmos] fs cat {} ok", norm);
                 if content.is_empty() {
                     self.push_line("(empty file)", color::TEXT_MUTED);
                 } else {
@@ -382,7 +505,7 @@ impl TerminalState {
                     }
                 }
             } else {
-                self.push_line(&format!("File not found: {}", name), color::DOT_RED);
+                self.push_line(&format!("File not found: {}", raw_name), color::DOT_RED);
             }
         } else if let Some(rest) = cmd.strip_prefix("write ") {
             if let Some((raw_name, text)) = rest.trim_start().split_once(' ') {
@@ -406,7 +529,9 @@ impl TerminalState {
                     payload.push('\n');
                 }
                 match fs::append(name, payload.as_bytes()) {
-                    Ok(n) => self.push_line(&format!("Appended {} B to {}", n, name), color::TERM_GREEN),
+                    Ok(n) => {
+                        self.push_line(&format!("Appended {} B to {}", n, name), color::TERM_GREEN)
+                    }
                     Err(e) => self.push_line(e, color::DOT_RED),
                 }
             } else {
@@ -433,11 +558,19 @@ impl TerminalState {
             }
         } else if let Some(arg) = cmd.strip_prefix("open ") {
             let target = arg.trim();
+            if let Some(file_arg) = target.strip_prefix("notepad ") {
+                let f = file_arg.trim();
+                if !f.is_empty() {
+                    self.push_line(&format!("Opening {} in Notepad", f), color::TERM_GREEN);
+                    return ShellAction::OpenInNotepad(String::from(f));
+                }
+            }
             let idx = match target {
                 "info" | "sys" => Some(0),
                 "term" | "terminal" => Some(1),
                 "paint" => Some(2),
                 "notepad" | "note" => Some(3),
+                "files" | "explorer" => Some(4),
                 _ => None,
             };
             if let Some(app_idx) = idx {
@@ -445,9 +578,25 @@ impl TerminalState {
                 return ShellAction::OpenApp(app_idx);
             } else {
                 self.push_line(
-                    "Unknown app. Use: open <info|term|paint|notepad>",
+                    "Unknown app. Use: open <info|term|paint|notepad|files>",
                     color::TERM_AMBER,
                 );
+            }
+        } else if cmd == "theme" {
+            self.push_line("Usage: theme <dark|ocean|amber>", color::TERM_AMBER);
+        } else if let Some(arg) = cmd.strip_prefix("theme ") {
+            let t = arg.trim();
+            let chosen = match t {
+                "dark" => Some(Theme::Dark),
+                "ocean" => Some(Theme::Ocean),
+                "amber" => Some(Theme::Amber),
+                _ => None,
+            };
+            if let Some(theme) = chosen {
+                self.push_line(&format!("Theme set to {}", theme.name()), color::TERM_GREEN);
+                return ShellAction::SetTheme(theme);
+            } else {
+                self.push_line("Unknown theme. Use: theme <dark|ocean|amber>", color::TERM_AMBER);
             }
         } else if cmd == "echo" {
             self.push_line("", color::TEXT_PRIMARY);
@@ -457,17 +606,21 @@ impl TerminalState {
             self.lines.clear();
         } else if cmd == "about" {
             self.push_line(
-                "wmos v2.0.0 - Minimal x86_64 Rust no_std OS",
+                "wmos v3.0.0 - Minimal x86_64 Rust no_std OS",
                 color::TERM_CYAN,
             );
             self.push_line(
-                "GDT/TSS + IDT/PIC + PMM/VMM/Heap + RTC + RAMFS + Double-Buffered GUI",
+                "GDT/IDT/PMM/VMM/Heap + PCI/AHCI/FAT32 + Scheduler + Double-Buf GUI",
                 color::TEXT_MUTED,
             );
         } else if cmd == "reboot" {
             self.push_line("Rebooting system", color::TERM_AMBER);
             crate::serial_println!("[wmos] reboot requested");
             cpu::reboot();
+        } else if cmd == "poweroff" {
+            self.push_line("Shutting down system", color::TERM_AMBER);
+            crate::serial_println!("[wmos] poweroff requested");
+            cpu::shutdown();
         } else {
             self.push_line(
                 &format!("Unknown command: '{}'. Type 'help'.", cmd),

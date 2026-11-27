@@ -1,6 +1,6 @@
 # WMOS 变更日志 (CHANGELOG)
 
-记录 WMOS 从初始引导原型到 `v2.0.0` 及后续演进的全部里程碑与代码级变更。
+记录 WMOS 从初始引导原型到 `v3.0.0` 及后续演进的全部里程碑与代码级变更。
 
 ---
 
@@ -18,23 +18,40 @@
 
 ---
 
-## [v2.0.0] - 2026-11-27
+## [v3.0.0] - 2026-11-27
 
 - **变更类型**：`feat` / `ci` / `docs`
 - **改动文件**：
-  - 内核与基础设施：`kernel/src/main.rs`、`kernel/src/arch/{mod.rs,rtc.rs}`、`kernel/src/mem/{mod.rs,heap.rs}`、`kernel/src/fs/mod.rs`
-  - 图形与交互终端：`kernel/src/shell.rs`、`kernel/src/gfx/{mod.rs,fb.rs,ui.rs,apps.rs,desktop.rs}`
+  - 内核、PCI/AHCI 与调度：`kernel/src/main.rs`、`kernel/src/arch/{io.rs,cpu.rs}`、`kernel/src/mem/vmm.rs`、`kernel/src/drivers/{mod.rs,pci.rs,ahci.rs}`、`kernel/src/task/mod.rs`
+  - FAT32 与存储：`kernel/src/fs/{mod.rs,fat32.rs}`
+  - 主题、文件管理器与终端：`kernel/src/gfx/{color.rs,apps.rs,desktop.rs}`、`kernel/src/shell.rs`
   - 校验与文档：`scripts/verify-qemu.sh`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
 - **变更摘要**：
-  - **CMOS RTC (`arch/rtc.rs`)**：读取 `0x70`/`0x71` 寄存器（含 UIP 等待、双读一致性、BCD 与 12h/24h 解码），提供 `RtcDateTime` 与任务栏实时日期时间显示。
-  - **内核堆 (`mem/heap.rs`)**：在 `HEAP_START = 0xFFFF_A000_0000_0000` 按空闲帧动态映射 `2 MiB .. 16 MiB`，实现带 `IrqGuard` 与 `AllocHeader` 的合并式自由链表 `#[global_allocator]`，启用 `extern crate alloc`。
-  - **内存文件系统 (`fs/mod.rs`)**：基于 `BTreeMap<String, Vec<u8>>` 实现 RAMFS（`list`/`read`/`write`/`append`/`touch`/`remove`/`stats`/`self_test`），预置 `readme.txt`、`motd.txt`、`notes.txt`。
-  - **双缓冲 GUI 与应用 (`gfx/{fb,ui,apps,desktop}.rs`)**：新增 `Vec<u32>` RAM 后备帧缓存（`<= 3_000_000` 像素）与 `present_rect`/`present_all` MMIO 刷新；新增标题栏三按钮（`Close`/`Minimize`/`Reset`）、Start 菜单、4 窗口管理及 `PaintApp`（360×220 画板）与 `NotepadApp`（读写 `notes.txt`）。
-  - **Shell 升级 (`shell.rs`)**：新增 64 条命令历史（`Up`/`Down`）、行内光标移动（`Left`/`Right`）、`Tab` 补全（命令/应用/文件名），扩展至 17 条命令（新增 `date`、`ls`、`cat`、`write`、`append`、`touch`、`rm`、`stat`、`open`）。
-  - **CI 校验与文档同步**：`scripts/verify-qemu.sh` 校验 14 项启动标记并在 UEFI 模式注入 `mouse_move 40 25` 及 `ls` / `write demo.txt hello` / `cat demo.txt` / `date` / `open paint` 交互验证；同步更新 `docs/DESIGN.md`、`docs/CHANGELOG.md` 与 `README.md`。
+  - **PCI 枚举 (`drivers/pci.rs`)**：基于 `0xCF8`/`0xCFC` 扫描总线 `0..=7`、设备 `0..32` 与多功能设备，输出 `[wmos] pci ok devices=<n>`。
+  - **AHCI SATA DMA (`drivers/ahci.rs` & `mem/vmm.rs`)**：VMM 新增 `WRITE_THROUGH` / `CACHE_DISABLE` 与 `hhdm_offset()`；映射 HBA BAR5 至 `0xFFFF_B000_0000_0000`，使用 PMM 物理 DMA 中转帧执行 `IDENTIFY (0xEC)` 与 `READ_DMA_EXT (0x25)`，输出 `[wmos] ahci ok disks=0|1`。
+  - **GPT + FAT32 只读 `/disk/` 挂载 (`fs/fat32.rs` & `fs/mod.rs`)**：解析 GPT `EFI PART` (`ef00` GUID) 与 FAT32 BPB/簇链/LFN+8.3 文件名，透明集成于 `disk/` 路径并强制写保护，输出 `[wmos] disk fat32 ok files=<n>` 或 `skipped`。
+  - **协作式多任务调度器 (`task/mod.rs`)**：通过 `global_asm!` `switch_context` / `task_trampoline` 运行 3 个 16 KiB 栈任务（`desktop-ui`、`sys-monitor`、`idle-worker`），开机验证 2 次切换并输出 `[wmos] sched ok tasks=3`，主循环每轮调用 `task::yield_now()`。
+  - **ACPI 关机 (`arch/{io,cpu}.rs`)**：新增 16/32 位端口读写与 `cpu::shutdown()`（`0x604`/`0xB004` `0x2000`、`0x4004` `0x3400`）。
+  - **GUI 与 Shell 升级 (`gfx/{color,apps,desktop}.rs` & `shell.rs`)**：新增 `Theme::{Dark, Ocean, Amber}`、5 窗口桌面与 `WMOS Files` 文件管理器（支持浏览与只读打开 `/disk/` 文件）、8 项 Start 菜单（含主题切换与 `Shutdown`）；终端扩展至 22 条命令（新增 `lspci`、`ps`、`disks`、`theme`、`poweroff` 及 `ls /disk`、`cat /disk/<path>`、`open files`、`open notepad <file>`）。
+  - **CI 校验与文档同步**：`scripts/verify-qemu.sh` 在 UEFI 模式挂载 `dist/wmos.img` 验证真实 AHCI + FAT32 `/disk/` 挂载，校验 17 项启动标记与 7 条交互命令（含 `cat /disk/boot/limine/limine.conf` 与 `open files`）；同步更新 `docs/DESIGN.md`、`docs/CHANGELOG.md` 与 `README.md`。
 - **验证结果**：
-  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings；ELF64 (`310000` B, `e_entry=0xffffffff800074c0`, 3 `PT_LOAD`)、`.sh` 纯 LF 与零禁用标记检查全部通过。
-  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端 BIOS/UEFI 双模式及交互验证。
+  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings；ELF64 (`355536` B, `e_entry=0xffffffff8000ccb0`, 3 `PT_LOAD`)、`.sh` 纯 LF 与零禁用标记检查全部通过。
+  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端 BIOS/UEFI + SATA 磁盘交互验证。
+
+---
+
+## [v2.0.0] - 2026-11-27
+
+### `4bd2fd7` — 新增内核堆、CMOS RTC、RAMFS、双缓冲桌面、Paint/Notepad 应用与文档同步
+- **变更类型**：`feat` / `ci` / `docs`
+- **改动文件**：
+  - `kernel/src/main.rs`、`kernel/src/arch/{mod.rs,rtc.rs}`、`kernel/src/mem/{mod.rs,heap.rs}`、`kernel/src/fs/mod.rs`
+  - `kernel/src/shell.rs`、`kernel/src/gfx/{mod.rs,fb.rs,ui.rs,apps.rs,desktop.rs}`
+  - `scripts/verify-qemu.sh`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
+- **变更摘要**：
+  - 实现 `HEAP_START = 0xFFFF_A000_0000_0000` 全局分配器、`0x70`/`0x71` CMOS RTC、`BTreeMap` RAMFS、`Vec<u32>` RAM 双缓冲帧缓存、`PaintApp` / `NotepadApp`、Start 菜单以及支持历史与 Tab 补全的 17 命令终端。
+- **验证结果**：
+  - GitHub Actions Run [`45925487872`](https://github.com/wmsir/wmos/actions/runs/45925487872) 全绿通过（BIOS + UEFI 双模式与 `ls`/`write`/`cat`/`date`/`open paint` 交互全部通过，产出 `wmos-images` `3372980` B 与 `wmos-ci-logs-and-preview` `12830` B）。
 
 ---
 
@@ -43,14 +60,11 @@
 ### `bec16e4` — 新增系统设计文档、变更日志与强制文档同步规范
 - **变更类型**：`docs`
 - **改动文件**：
-  - `docs/DESIGN.md`
-  - `docs/CHANGELOG.md`
-  - `AGENTS.md`
-  - `README.md`
+  - `docs/DESIGN.md`、`docs/CHANGELOG.md`、`AGENTS.md`、`README.md`
 - **变更摘要**：
   - 建立代码核验版 `docs/DESIGN.md`、`docs/CHANGELOG.md` 与 `AGENTS.md` 文档同步硬性规范，并在 `README.md` 顶部补充规范入口与目录树。
 - **验证结果**：
-  - 本地文档链接与 Mermaid 审计通过；GitHub Actions Run [`45922116722`](https://github.com/wmsir/wmos/actions/runs/45922116722) 全绿通过（`wmos-images` `3170777` B、`wmos-ci-logs-and-preview` `12454` B）。
+  - GitHub Actions Run [`45922116722`](https://github.com/wmsir/wmos/actions/runs/45922116722) 全绿通过（`wmos-images` `3170777` B、`wmos-ci-logs-and-preview` `12454` B）。
 
 ---
 
@@ -59,11 +73,9 @@
 ### `c494b6d` — 修复 PS/2 鼠标初始化与中断状态同步竞争
 - **变更类型**：`fix`
 - **改动文件**：
-  - `kernel/src/drivers/ps2.rs`
-  - `kernel/src/drivers/mouse.rs`
-  - `kernel/src/drivers/keyboard.rs`
+  - `kernel/src/drivers/{ps2.rs,mouse.rs,keyboard.rs}`
 - **变更摘要**：
-  - `ps2::init()` 在发送鼠标 `0xF6` / `0xF4` 与 `flush()` 期间保持 IRQ1/IRQ12（`0x03`）屏蔽，待 ACK 清空后再启用 `0x03`；`mouse::on_irq()` 校验 `(inb(0x64) & 0x21) == 0x21` 且 `cycle == 0` 要求 `(byte & 0xC8) == 0x08`；`keyboard::on_irq()` 校验 `(status & 0x01) != 0 && (status & 0x20) == 0`。
+  - `ps2::init()` 在发送鼠标 `0xF6` / `0xF4` 与 `flush()` 期间保持 IRQ1/IRQ12 屏蔽，并在 `mouse`/`keyboard` 中增加 `0x64` 状态校验与 `cycle == 0` 同步校验。
 - **验证结果**：
   - GitHub Actions Run [`45913901340`](https://github.com/wmsir/wmos/actions/runs/45913901340) 全绿通过（`[wmos] mouse active (756, 385)` 与 `[wmos] cmd: help` 均通过，产出 `wmos-images` `3170785` B）。
 
@@ -71,8 +83,7 @@
 - **变更类型**：`feat`
 - **改动文件**：
   - `kernel/src/arch/{mod.rs,cpu.rs,gdt.rs,idt.rs,pic.rs,pit.rs}`、`kernel/src/mem/{mod.rs,pmm.rs,vmm.rs}`
-  - `kernel/src/drivers/{mod.rs,ps2.rs,keyboard.rs,mouse.rs}`、`kernel/src/shell.rs`、`kernel/src/gfx/{mod.rs,fb.rs,ui.rs,desktop.rs}`、`kernel/src/main.rs`
-  - `scripts/verify-qemu.sh`、`README.md`
+  - `kernel/src/drivers/{mod.rs,ps2.rs,keyboard.rs,mouse.rs}`、`kernel/src/shell.rs`、`kernel/src/gfx/{mod.rs,fb.rs,ui.rs,desktop.rs}`、`kernel/src/main.rs`、`scripts/verify-qemu.sh`、`README.md`
 - **变更摘要**：
   - 新增 GDT/TSS（16 KiB IST1）、256 项 IDT、`8259 PIC`、`100 Hz PIT`、PMM 位图、VMM 4 级页表、PS/2 键鼠驱动、`CursorLayer` 防残影与交互终端。
 - **验证结果**：

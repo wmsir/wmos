@@ -10,6 +10,7 @@ mod fs;
 mod gfx;
 mod mem;
 mod shell;
+mod task;
 
 use core::panic::PanicInfo;
 
@@ -121,6 +122,30 @@ pub extern "C" fn kmain() -> ! {
         fs_st.total_bytes
     );
 
+    let pci_cnt = drivers::pci::init();
+    serial_println!("[wmos] pci ok devices={}", pci_cnt);
+
+    if let Some(disk) = drivers::ahci::init() {
+        serial_println!(
+            "[wmos] ahci ok disks=1 model={} sectors={}",
+            disk.model_str(),
+            disk.sectors
+        );
+    } else {
+        serial_println!("[wmos] ahci ok disks=0");
+    }
+
+    let fat_files = fs::mount_fat32_disk();
+    if fs::is_disk_mounted() {
+        serial_println!("[wmos] disk fat32 ok files={}", fat_files);
+    } else {
+        serial_println!("[wmos] disk fat32 skipped");
+    }
+
+    task::init();
+    assert!(task::total_switches() >= 2, "Scheduler self-test failed");
+    serial_println!("[wmos] sched ok tasks={}", task::list().len());
+
     arch::pit::init();
     drivers::mouse::set_bounds(summary.fb.width, summary.fb.height);
     drivers::ps2::init();
@@ -165,6 +190,7 @@ pub extern "C" fn kmain() -> ! {
             last_ui_tick = now;
             desktop.handle_tick(now);
         }
+        task::yield_now();
         arch::cpu::cli();
         if !drivers::keyboard::has_pending()
             && !drivers::mouse::is_dirty()

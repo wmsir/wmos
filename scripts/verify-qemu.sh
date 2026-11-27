@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-if [[ ! -f "dist/wmos.iso" ]]; then
-    echo "ERROR: dist/wmos.iso not found. Run ./scripts/build-images.sh first." >&2
+if [[ ! -f "dist/wmos.iso" || ! -f "dist/wmos.img" ]]; then
+    echo "ERROR: dist/wmos.iso or dist/wmos.img not found. Run ./scripts/build-images.sh first." >&2
     exit 1
 fi
 
@@ -71,6 +71,7 @@ qemu-system-x86_64 \
     -m 256M \
     -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
     -cdrom dist/wmos.iso \
+    -drive "file=dist/wmos.img,format=raw" \
     -vga std \
     -display none \
     -serial file:dist/qemu-uefi.log \
@@ -126,6 +127,10 @@ def map_key(ch: str) -> bytes:
         return b"spc"
     if ch == ".":
         return b"dot"
+    if ch == "/":
+        return b"slash"
+    if ch == "-":
+        return b"minus"
     raise ValueError(f"Unsupported key character: {ch!r}")
 
 def send_command(sock: socket.socket, text: str) -> None:
@@ -146,19 +151,21 @@ if os.path.exists(sock_path):
         time.sleep(0.08)
 
         for cmd in (
-            "ls",
+            "lspci",
+            "ps",
+            "disks",
+            "cat /disk/boot/limine/limine.conf",
             "write demo.txt hello",
             "cat demo.txt",
-            "date",
-            "open paint",
+            "open files",
         ):
             send_command(s, cmd)
 
-        deadline = time.monotonic() + 4.0
+        deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             if os.path.exists(uefi_log_path):
                 with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
-                    if "[wmos] cmd: open paint" in lf.read():
+                    if "[wmos] cmd: open files" in lf.read():
                         break
             time.sleep(0.1)
 
@@ -280,6 +287,9 @@ assert_log() {
         "[wmos] heap self-test ok"
         "[wmos] rtc ok"
         "[wmos] fs ok"
+        "[wmos] pci ok"
+        "[wmos] ahci ok"
+        "[wmos] sched ok"
         "[wmos] pit+ps2 ok"
         "[wmos] fb="
         "[wmos] fb double-buffer ok"
@@ -298,13 +308,17 @@ assert_log "dist/qemu-bios.log" "BIOS"
 assert_log "dist/qemu-uefi.log" "UEFI"
 
 for uefi_marker in \
+    "[wmos] ahci ok disks=1" \
+    "[wmos] disk fat32 ok" \
     "[wmos] mouse active" \
-    "[wmos] cmd: ls" \
+    "[wmos] cmd: lspci" \
+    "[wmos] cmd: ps" \
+    "[wmos] cmd: disks" \
+    "[wmos] cmd: cat /disk/boot/limine/limine.conf" \
+    "[wmos] fs cat disk/boot/limine/limine.conf ok" \
     "[wmos] cmd: write demo.txt hello" \
-    "[wmos] cmd: cat demo.txt" \
     "[wmos] fs cat demo.txt ok" \
-    "[wmos] cmd: date" \
-    "[wmos] cmd: open paint"
+    "[wmos] cmd: open files"
 do
     if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
         echo "ERROR: UEFI log missing interactive marker: ${uefi_marker}" >&2

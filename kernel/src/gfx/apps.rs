@@ -1,3 +1,4 @@
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -57,7 +58,15 @@ impl PaintApp {
         }
     }
 
-    fn stroke_canvas(&mut self, x0: isize, y0: isize, x1: isize, y1: isize, radius: usize, col: Color) {
+    fn stroke_canvas(
+        &mut self,
+        x0: isize,
+        y0: isize,
+        x1: isize,
+        y1: isize,
+        radius: usize,
+        col: Color,
+    ) {
         let dx = (x1 - x0).abs();
         let sx = if x0 < x1 { 1 } else { -1 };
         let dy = -(y1 - y0).abs();
@@ -111,7 +120,6 @@ impl PaintApp {
         fb.fill_rect(ox, oy, cw, TOOLBAR_H, color::WIN_TITLE_INACTIVE);
         fb.draw_hline(ox, oy + TOOLBAR_H, cw, color::WIN_BORDER);
 
-        // 6 color swatches
         for (i, &col) in SWATCH_COLORS.iter().enumerate() {
             let sx = ox + 8 + i * 24;
             let sy = oy + 5;
@@ -127,7 +135,6 @@ impl PaintApp {
             fb.draw_rect_outline(sx, sy, 18, 18, 1, border);
         }
 
-        // Brush size toggle [S] / [L]
         let size_x = ox + 158;
         let size_y = oy + 5;
         if size_x + 36 < ox + cw {
@@ -135,7 +142,6 @@ impl PaintApp {
             draw_button(fb, size_x, size_y, 32, 18, size_label, color::TASKBAR_TAB_ACTIVE);
         }
 
-        // [Clear] button
         let clr_x = ox + 198;
         if clr_x + 56 < ox + cw {
             draw_button(fb, clr_x, size_y, 52, 18, "Clear", color::TASKBAR_TAB_INACTIVE);
@@ -212,6 +218,8 @@ impl PaintApp {
 }
 
 pub struct NotepadApp {
+    filename: String,
+    read_only: bool,
     text: String,
     status: &'static str,
 }
@@ -220,12 +228,25 @@ impl NotepadApp {
     pub fn new() -> Self {
         let text = fs::read_to_string("notes.txt").unwrap_or_default();
         Self {
+            filename: String::from("notes.txt"),
+            read_only: false,
             text,
             status: "Loaded",
         }
     }
 
+    pub fn open_file(&mut self, name: &str) {
+        let clean = name.trim().trim_start_matches('/');
+        self.filename = String::from(clean);
+        self.read_only = clean.starts_with("disk/");
+        self.text = fs::read_to_string(clean).unwrap_or_default();
+        self.status = if self.read_only { "ReadOnly" } else { "Loaded" };
+    }
+
     pub fn handle_key(&mut self, ev: KeyEvent) -> bool {
+        if self.read_only {
+            return false;
+        }
         match ev {
             KeyEvent::Char(b) if (0x20..=0x7E).contains(&b) => {
                 self.text.push(b as char);
@@ -269,22 +290,34 @@ impl NotepadApp {
         if my < by || my >= by + 18 {
             return false;
         }
-        let load_x = ox + 92;
-        let save_x = ox + 144;
-        let clear_x = ox + 196;
+        let load_x = ox + 104;
+        let save_x = ox + 154;
+        let clear_x = ox + 204;
 
-        if mx >= load_x && mx < load_x + 46 {
-            self.text = fs::read_to_string("notes.txt").unwrap_or_default();
-            self.status = "Loaded";
+        if mx >= load_x && mx < load_x + 44 {
+            self.text = fs::read_to_string(self.filename.as_str()).unwrap_or_default();
+            self.status = if self.read_only { "ReadOnly" } else { "Loaded" };
             return true;
         }
-        if mx >= save_x && mx < save_x + 46 {
-            let _ = fs::write("notes.txt", self.text.as_bytes());
-            crate::serial_println!("[wmos] notepad saved notes.txt ({} B)", self.text.len());
+        if mx >= save_x && mx < save_x + 44 {
+            if self.read_only {
+                self.status = "ReadOnly";
+                return true;
+            }
+            let _ = fs::write(self.filename.as_str(), self.text.as_bytes());
+            crate::serial_println!(
+                "[wmos] notepad saved {} ({} B)",
+                self.filename,
+                self.text.len()
+            );
             self.status = "Saved";
             return true;
         }
-        if mx >= clear_x && mx < clear_x + 52 {
+        if mx >= clear_x && mx < clear_x + 50 {
+            if self.read_only {
+                self.status = "ReadOnly";
+                return true;
+            }
             self.text.clear();
             self.status = "Cleared";
             return true;
@@ -304,26 +337,32 @@ impl NotepadApp {
         fb.fill_rect(ox, oy, cw, TOOLBAR_H, color::WIN_TITLE_INACTIVE);
         fb.draw_hline(ox, oy + TOOLBAR_H, cw, color::WIN_BORDER);
 
-        fb.draw_str(ox + 8, oy + 10, "notes.txt", color::TERM_CYAN, None);
+        let short_name = self
+            .filename
+            .rsplit('/')
+            .next()
+            .unwrap_or(self.filename.as_str());
+        for (i, ch_val) in short_name.chars().take(11).enumerate() {
+            fb.draw_char(ox + 8 + i * 8, oy + 10, ch_val, color::TERM_CYAN, None);
+        }
 
         let by = oy + 5;
-        if ox + 252 < ox + cw {
-            draw_button(fb, ox + 92, by, 46, 18, "Load", color::TASKBAR_TAB_INACTIVE);
-            draw_button(fb, ox + 144, by, 46, 18, "Save", color::TASKBAR_TAB_ACTIVE);
-            draw_button(fb, ox + 196, by, 52, 18, "Clear", color::TASKBAR_TAB_INACTIVE);
+        if ox + 258 < ox + cw {
+            draw_button(fb, ox + 104, by, 44, 18, "Load", color::TASKBAR_TAB_INACTIVE);
+            draw_button(fb, ox + 154, by, 44, 18, "Save", color::TASKBAR_TAB_ACTIVE);
+            draw_button(fb, ox + 204, by, 50, 18, "Clear", color::TASKBAR_TAB_INACTIVE);
         }
 
         let status_w = self.status.len() * 8;
-        if cw > 264 + status_w {
+        if cw > 268 + status_w {
             let st_col = match self.status {
                 "Saved" => color::TERM_GREEN,
-                "Modified" => color::TERM_AMBER,
+                "Modified" | "ReadOnly" => color::TERM_AMBER,
                 _ => color::TEXT_MUTED,
             };
             fb.draw_str(ox + cw - status_w - 8, oy + 10, self.status, st_col, None);
         }
 
-        // Editor body
         let ex = ox + 6;
         let ey = oy + TOOLBAR_H + 6;
         let ew = cw.saturating_sub(12);
@@ -368,11 +407,224 @@ impl NotepadApp {
             row_idx = i;
         }
 
-        if blink {
+        if blink && !self.read_only {
             if let Some(last_line) = wrapped.last() {
                 let cx = text_x + last_line.len().min(max_cols.saturating_sub(1)) * 8;
                 let cy = text_y + row_idx * line_step;
                 fb.draw_char(cx, cy, '_', color::TERM_CYAN, None);
+            }
+        }
+    }
+}
+
+pub enum FilesAction {
+    OpenFile(String),
+}
+
+pub struct FilesApp {
+    entries: Vec<(String, bool, usize)>,
+    selected: Option<usize>,
+    scroll: usize,
+    next_note_id: usize,
+    status: &'static str,
+}
+
+impl FilesApp {
+    pub fn new() -> Self {
+        let mut app = Self {
+            entries: Vec::new(),
+            selected: None,
+            scroll: 0,
+            next_note_id: 1,
+            status: "Ready",
+        };
+        app.refresh();
+        app
+    }
+
+    pub fn refresh(&mut self) {
+        self.entries.clear();
+        for entry in fs::list() {
+            self.entries.push((entry.name, false, entry.size));
+        }
+        for entry in fs::list_disk() {
+            self.entries.push((entry.name, true, entry.size));
+        }
+        if self.entries.is_empty() {
+            self.selected = None;
+            self.scroll = 0;
+        } else {
+            if let Some(sel) = self.selected {
+                if sel >= self.entries.len() {
+                    self.selected = Some(self.entries.len() - 1);
+                }
+            } else {
+                self.selected = Some(0);
+            }
+            if self.scroll >= self.entries.len() {
+                self.scroll = 0;
+            }
+        }
+    }
+
+    pub fn handle_mouse(
+        &mut self,
+        win: &Window,
+        mx: usize,
+        my: usize,
+        just_pressed: bool,
+    ) -> (bool, Option<FilesAction>) {
+        if !just_pressed {
+            return (false, None);
+        }
+        let (ox, oy) = win.client_origin();
+        let cw = win.w.saturating_sub(BORDER_W * 2);
+        let ch = (win.y + win.h).saturating_sub(oy + BORDER_W);
+
+        let by = oy + 5;
+        if my >= by && my < by + 18 {
+            if mx >= ox + 8 && mx < ox + 52 {
+                if let Some(idx) = self.selected {
+                    if let Some((name, _, _)) = self.entries.get(idx) {
+                        self.status = "Opened";
+                        return (true, Some(FilesAction::OpenFile(name.clone())));
+                    }
+                }
+                return (false, None);
+            }
+            if mx >= ox + 58 && mx < ox + 98 {
+                loop {
+                    let candidate = format!("note_{}.txt", self.next_note_id);
+                    self.next_note_id += 1;
+                    if fs::read(candidate.as_str()).is_none() {
+                        let _ = fs::write(candidate.as_str(), b"New note\n");
+                        self.refresh();
+                        self.selected = self
+                            .entries
+                            .iter()
+                            .position(|(n, is_disk, _)| !*is_disk && n == &candidate);
+                        self.status = "Created";
+                        return (true, None);
+                    }
+                }
+            }
+            if mx >= ox + 104 && mx < ox + 144 {
+                if let Some(idx) = self.selected {
+                    if let Some((name, is_disk, _)) = self.entries.get(idx).cloned() {
+                        if is_disk {
+                            self.status = "Read-only";
+                            return (true, None);
+                        }
+                        let _ = fs::remove(name.as_str());
+                        self.refresh();
+                        self.status = "Deleted";
+                        return (true, None);
+                    }
+                }
+                return (false, None);
+            }
+            if mx >= ox + 150 && mx < ox + 214 {
+                self.refresh();
+                self.status = "Refreshed";
+                return (true, None);
+            }
+        }
+
+        let ex = ox + 6;
+        let ey = oy + TOOLBAR_H + 6;
+        let ew = cw.saturating_sub(12);
+        let eh = ch.saturating_sub(TOOLBAR_H + 12);
+        if mx >= ex && mx < ex + ew && my >= ey + 4 && my < ey + eh {
+            let row = (my - (ey + 4)) / 16;
+            let idx = self.scroll + row;
+            if idx < self.entries.len() {
+                self.selected = Some(idx);
+                self.status = if self.entries[idx].1 { "FAT32" } else { "RAMFS" };
+                return (true, None);
+            }
+        }
+
+        (false, None)
+    }
+
+    pub fn render(&self, fb: &mut Framebuffer, win: &Window) {
+        let (ox, oy) = win.client_origin();
+        let cw = win.w.saturating_sub(BORDER_W * 2);
+        let ch = (win.y + win.h).saturating_sub(oy + BORDER_W);
+        if cw < 64 || ch < TOOLBAR_H + 24 {
+            return;
+        }
+
+        fb.fill_rect(ox, oy, cw, ch, color::WIN_BG);
+        fb.fill_rect(ox, oy, cw, TOOLBAR_H, color::WIN_TITLE_INACTIVE);
+        fb.draw_hline(ox, oy + TOOLBAR_H, cw, color::WIN_BORDER);
+
+        let by = oy + 5;
+        if ox + 220 < ox + cw {
+            draw_button(fb, ox + 8, by, 44, 18, "Open", color::TASKBAR_TAB_ACTIVE);
+            draw_button(fb, ox + 58, by, 40, 18, "New", color::TASKBAR_TAB_INACTIVE);
+            draw_button(fb, ox + 104, by, 40, 18, "Del", color::TASKBAR_TAB_INACTIVE);
+            draw_button(fb, ox + 150, by, 64, 18, "Refresh", color::TASKBAR_TAB_INACTIVE);
+        }
+
+        let badge = format!("{} | {}", self.entries.len(), self.status);
+        let bw = badge.len() * 8;
+        if cw > 224 + bw {
+            let bcol = if self.status == "Read-only" {
+                color::TERM_AMBER
+            } else {
+                color::TERM_CYAN
+            };
+            fb.draw_str(ox + cw - bw - 8, oy + 10, badge.as_str(), bcol, None);
+        }
+
+        let ex = ox + 6;
+        let ey = oy + TOOLBAR_H + 6;
+        let ew = cw.saturating_sub(12);
+        let eh = ch.saturating_sub(TOOLBAR_H + 12);
+        if ew < 32 || eh < 24 {
+            return;
+        }
+
+        fb.fill_rect(ex, ey, ew, eh, color::TERM_BG);
+        fb.draw_rect_outline(ex, ey, ew, eh, 1, color::WIN_BORDER);
+
+        let row_h = 16usize;
+        let max_rows = eh.saturating_sub(8) / row_h;
+        let max_cols = ew.saturating_sub(16) / 8;
+
+        for (r, (name, is_disk, size)) in self.entries.iter().skip(self.scroll).take(max_rows).enumerate() {
+            let idx = self.scroll + r;
+            let ry = ey + 4 + r * row_h;
+            if self.selected == Some(idx) {
+                fb.fill_rect(ex + 2, ry, ew.saturating_sub(4), row_h, color::TASKBAR_TAB_ACTIVE);
+            }
+
+            let (tag, tag_col) = if *is_disk {
+                ("[DISK]", color::TERM_CYAN)
+            } else {
+                ("[RAM ]", color::TERM_GREEN)
+            };
+            fb.draw_str(ex + 6, ry + 4, tag, tag_col, None);
+
+            let size_str = if *size >= 1024 {
+                format!("{}K", size / 1024)
+            } else {
+                format!("{}B", size)
+            };
+            let size_cols = size_str.len();
+            let name_cols = max_cols.saturating_sub(8 + size_cols);
+            for (ci, ch_val) in name.chars().take(name_cols).enumerate() {
+                fb.draw_char(ex + 6 + (7 + ci) * 8, ry + 4, ch_val, color::TEXT_PRIMARY, None);
+            }
+            if ew > (size_cols + 2) * 8 {
+                fb.draw_str(
+                    ex + ew - (size_cols + 1) * 8,
+                    ry + 4,
+                    size_str.as_str(),
+                    color::TEXT_MUTED,
+                    None,
+                );
             }
         }
     }

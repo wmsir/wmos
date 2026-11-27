@@ -6,6 +6,8 @@ use crate::mem::pmm;
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
+pub const WRITE_THROUGH: u64 = 1 << 3;
+pub const CACHE_DISABLE: u64 = 1 << 4;
 #[allow(dead_code)]
 pub const NO_EXECUTE: u64 = 1 << 63;
 
@@ -20,20 +22,21 @@ pub fn init(hhdm_offset: u64) {
     HHDM_OFFSET.store(hhdm_offset, Ordering::Release);
 }
 
+/// Returns the active Limine Higher-Half Direct Map physical-to-virtual offset.
 #[inline]
-fn hhdm() -> u64 {
+pub fn hhdm_offset() -> u64 {
     HHDM_OFFSET.load(Ordering::Acquire)
 }
 
 #[inline]
 unsafe fn table_mut<'a>(phys: u64) -> &'a mut [u64; 512] {
-    let virt = (phys + hhdm()) as *mut [u64; 512];
+    let virt = (phys + hhdm_offset()) as *mut [u64; 512];
     unsafe { &mut *virt }
 }
 
 #[inline]
 unsafe fn table_ref<'a>(phys: u64) -> &'a [u64; 512] {
-    let virt = (phys + hhdm()) as *const [u64; 512];
+    let virt = (phys + hhdm_offset()) as *const [u64; 512];
     unsafe { &*virt }
 }
 
@@ -85,7 +88,8 @@ pub fn map_page(virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
             return Err("Virtual page is already mapped");
         }
 
-        pt[i1] = (phys & ADDR_MASK) | (flags & (PRESENT | WRITABLE | NO_EXECUTE)) | PRESENT;
+        let allowed = PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE;
+        pt[i1] = (phys & ADDR_MASK) | (flags & allowed) | PRESENT;
     }
 
     cpu::invlpg(virt);
@@ -197,7 +201,7 @@ pub fn self_test() -> bool {
     unsafe {
         write_volatile(virt as *mut u64, MAGIC);
         let read_virt = read_volatile(virt as *const u64);
-        let read_hhdm = read_volatile((phys + hhdm()) as *const u64);
+        let read_hhdm = read_volatile((phys + hhdm_offset()) as *const u64);
         if read_virt != MAGIC || read_hhdm != MAGIC {
             passed = false;
         }
