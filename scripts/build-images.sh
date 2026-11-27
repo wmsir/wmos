@@ -23,14 +23,22 @@ fi
 
 mkdir -p dist
 
+# Assemble and link Ring-3 userland ELF64 program (dist/hello.elf)
+if [[ ! -f "user/hello.S" ]]; then
+    echo "ERROR: user/hello.S not found" >&2
+    exit 1
+fi
+gcc -nostdlib -static -no-pie -Wl,-Ttext=0x400000 -Wl,--build-id=none user/hello.S -o dist/hello.elf
+
 # Build hybrid BIOS + UEFI ISO (dist/wmos.iso)
 rm -rf iso_root
-mkdir -p iso_root/boot/limine iso_root/EFI/BOOT
+mkdir -p iso_root/boot/limine iso_root/EFI/BOOT iso_root/bin
 
 cp "${KERNEL_BIN}" iso_root/boot/wmos-kernel
 cp boot/limine.conf iso_root/boot/limine/limine.conf
 cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/boot/limine/
 cp limine/BOOTX64.EFI limine/BOOTIA32.EFI iso_root/EFI/BOOT/
+cp dist/hello.elf iso_root/bin/hello.elf
 
 rm -f dist/wmos.iso
 xorriso -as mkisofs \
@@ -51,11 +59,12 @@ sgdisk dist/wmos.img \
 ./limine/limine bios-install dist/wmos.img 1
 
 mformat -i dist/wmos.img@@2M -T 122880 -F ::
-mmd -i dist/wmos.img@@2M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
+mmd -i dist/wmos.img@@2M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine ::/bin
 mcopy -i dist/wmos.img@@2M "${KERNEL_BIN}" ::/boot/wmos-kernel
 mcopy -i dist/wmos.img@@2M boot/limine.conf ::/boot/limine/limine.conf
 mcopy -i dist/wmos.img@@2M limine/limine-bios.sys ::/boot/limine/
 mcopy -i dist/wmos.img@@2M limine/BOOTX64.EFI limine/BOOTIA32.EFI ::/EFI/BOOT/
+mcopy -i dist/wmos.img@@2M dist/hello.elf ::/bin/hello.elf
 
 # Convert raw disk image to VM formats
 qemu-img convert -f raw -O qcow2 dist/wmos.img dist/wmos.qcow2

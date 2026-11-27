@@ -930,7 +930,7 @@ fn render_desktop_header(fb: &mut Framebuffer, w: usize, work_h: usize) {
         fb.draw_str(
             24,
             14,
-            "WMOS v4.1.0 // x86_64 AHCI FAT32 RW + e1000 Net + Desktop",
+            "WMOS v4.2.0 // x86_64 FAT32 RW + e1000 Net + Ring-3 ELF64",
             color::TEXT_MUTED,
             None,
         );
@@ -1096,7 +1096,7 @@ fn render_system_info_content(
         y,
         max_w,
         max_y,
-        "OS      : wmos v4.1.0 (x86_64 no_std)",
+        "OS      : wmos v4.2.0 (x86_64 no_std)",
         color::TEXT_PRIMARY,
     );
     y += line_step;
@@ -1246,6 +1246,17 @@ fn render_system_info_content(
         theme.name()
     );
     draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_CYAN);
+    y += line_step;
+
+    draw_clipped_line(
+        fb,
+        x,
+        y,
+        max_w,
+        max_y,
+        "Ring-3  : Syscall + ELF64 READY",
+        color::TERM_GREEN,
+    );
     y += line_step + 2;
 
     if y + 4 <= max_y {
@@ -1257,7 +1268,7 @@ fn render_system_info_content(
         ("[OK] Kernel : GDT/IDT/PIC/PMM/VMM/Heap", color::TERM_GREEN),
         ("[OK] Drivers: PCI/AHCI/e1000/RTC/PS2", color::TERM_GREEN),
         ("[OK] Storage: RAMFS + FAT32 RW + Files", color::TERM_GREEN),
-        ("[OK] Desktop: Double-Buf + Sched + Net", color::TERM_GREEN),
+        ("[OK] User   : Ring-3 Syscall + ELF64", color::TERM_GREEN),
     ];
     for &(item, col) in &checklist {
         if y + 8 > max_y {

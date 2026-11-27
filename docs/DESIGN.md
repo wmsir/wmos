@@ -1,4 +1,4 @@
-# WMOS (`v4.1.0`) 系统设计与架构文档
+# WMOS (`v4.2.0`) 系统设计与架构文档
 
 > 本文档严格对应仓库当前实现代码，所有地址、常数、数据结构、中断向量、串口标记与构建/验证流程均以实际源码为准。
 
@@ -6,7 +6,7 @@
 
 ## 1. 项目概览与工程定位
 
-**WMOS**（crate `wmos-kernel` v0.1.0 / 里程碑 `v4.1.0`）是一个基于 **Rust Stable (`#![no_std]`, `#![no_main]`, `edition = "2021"`)** 与 **Limine v10 引导协议** 构建的独立 `x86_64` 微内核桌面操作系统。
+**WMOS**（crate `wmos-kernel` v0.1.0 / 里程碑 `v4.2.0`）是一个基于 **Rust Stable (`#![no_std]`, `#![no_main]`, `edition = "2021"`)** 与 **Limine v10 引导协议** 构建的独立 `x86_64` 微内核桌面操作系统。
 
 - **工程与工具链约束**：
   - 锁定工具链 `channel = "stable"`，目标三元组 `x86_64-unknown-none`（见 [rust-toolchain.toml](../rust-toolchain.toml)）。
@@ -27,18 +27,21 @@
 flowchart TD
     Boot["Limine v10 Bootloader\n(BIOS / UEFI)"] --> Entry["kmain\nkernel/src/main.rs"]
     Entry --> BootInfo["BootSummary / FramebufferInfo\nkernel/src/boot_info.rs"]
-    Entry --> Arch["Arch Layer\ngdt / idt / pic / pit / rtc / serial / cpu / io"]
-    Entry --> Mem["Memory Layer\npmm (Bitmap) / vmm (4-Level) / heap (GlobalAlloc)"]
+    Entry --> Arch["Arch Layer\ngdt / idt / syscall / pic / pit / rtc / serial / cpu / io"]
+    Entry --> Mem["Memory Layer\npmm / vmm (UserAddressSpace) / heap"]
     Entry --> Drivers["Drivers Layer\npci / ahci (SATA RW) / e1000 (NIC DMA) / ps2 / kbd / mouse"]
     Entry --> FS["Storage Layer\nRAMFS + FAT32 RW /disk/ (kernel/src/fs/{mod,fat32}.rs)"]
     Entry --> Task["Cooperative Scheduler\nkernel/src/task/mod.rs (3 Tasks)"]
     Entry --> Net["Network Layer\nARP / ICMP / UDP (kernel/src/net/mod.rs)"]
+    Entry --> User["Ring-3 Userland\nELF64 Loader + user/hello.S (kernel/src/user/elf.rs)"]
     Entry --> Loop["Low-Power Event Loop\nnet::poll() + yield_now() + sti_and_hlt()"]
 
     Drivers --> FS
     Drivers --> Net
     Drivers --> Loop
     Net --> Loop
+    Arch --> User
+    Mem --> User
     Arch --> Loop
     Task --> Loop
     Loop --> Desktop["DesktopState\nkernel/src/gfx/desktop.rs"]
@@ -50,6 +53,7 @@ flowchart TD
     Shell --> Mem
     Shell --> Drivers
     Shell --> Net
+    Shell --> User
     Shell --> Task
     Shell --> Arch
     Apps --> FS
@@ -68,31 +72,35 @@ flowchart TD
 | [boot/limine.conf](../boot/limine.conf) | Limine v10 引导配置（`timeout: 1`，`protocol: limine`，`boot():/boot/wmos-kernel`） |
 | [docs/DESIGN.md](DESIGN.md) | 系统架构与核心子系统设计文档（本文档） |
 | [docs/CHANGELOG.md](CHANGELOG.md) | 版本里程碑与变更追踪日志 |
-| [scripts/build-images.sh](../scripts/build-images.sh) | 构建 `wmos.iso`、`wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt` |
-| [scripts/verify-qemu.sh](../scripts/verify-qemu.sh) | 无头 QEMU BIOS/UEFI（含 SATA 磁盘持久化、冷重启与 e1000 `ping`）断言、命令注入与 `boot-preview.png` 导出 |
+| [scripts/build-images.sh](../scripts/build-images.sh) | 编译链接 `user/hello.S` 为 `dist/hello.elf` 并构建 `wmos.iso`、`wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt` |
+| [scripts/verify-qemu.sh](../scripts/verify-qemu.sh) | 无头 QEMU BIOS/UEFI（含 SATA 磁盘持久化、冷重启、e1000 `ping` 与 Ring-3 `exec`）断言、命令注入与 `boot-preview.png` 导出 |
+| [user/hello.S](../user/hello.S) | 独立 Ring-3 x86_64 AT&T 汇编用户程序（链接至 `0x400000` 并打包为 `/bin/hello.elf`） |
 | [kernel/Cargo.toml](../kernel/Cargo.toml) | `wmos-kernel` crate 元数据与 `limine = "0.5"` 依赖 |
 | [kernel/.cargo/config.toml](../kernel/.cargo/config.toml) | 裸机目标与 `relocation-model=static`、`code-model=kernel` 编译参数 |
 | [kernel/build.rs](../kernel/build.rs) | 传入 `-T kernel/linker-x86_64.ld` 链接参数并监听脚本变更 |
 | [kernel/linker-x86_64.ld](../kernel/linker-x86_64.ld) | 高半核 ELF64 链接脚本（基址 `0xffffffff80000000`） |
-| [kernel/src/main.rs](../kernel/src/main.rs) | `kmain` 初始化序列、`net::poll()` + `task::yield_now()` + `sti_and_hlt()` 主循环与 `panic_handler` |
+| [kernel/src/main.rs](../kernel/src/main.rs) | `kmain` 初始化序列、`syscall::init()`、`net::poll()`、`task::yield_now()` + `sti_and_hlt()` 主循环与 `panic_handler` |
 | [kernel/src/boot_info.rs](../kernel/src/boot_info.rs) | `BootSummary` 与 `FramebufferInfo` 引导信息契约 |
-| [kernel/src/shell.rs](../kernel/src/shell.rs) | `TerminalState`、64 条命令历史、Tab 补全、`ShellAction` 与 25 条内置命令（含 `ifconfig`/`ping`/`udp`） |
+| [kernel/src/shell.rs](../kernel/src/shell.rs) | `TerminalState`、64 条命令历史、Tab 补全、`ShellAction` 与 26 条内置命令（含 `ifconfig`/`ping`/`udp`/`exec`） |
 | [kernel/src/task/mod.rs](../kernel/src/task/mod.rs) | 3 任务协作式调度器、`global_asm!` 上下文切换与 `TaskInfo` |
+| [kernel/src/user/mod.rs](../kernel/src/user/mod.rs) | 用户态子系统导出：`elf` |
+| [kernel/src/user/elf.rs](../kernel/src/user/elf.rs) | ELF64 `ET_EXEC` 加载器、`UserAddressSpace` 隔离、16 KiB 用户栈与 `ExecOutput` / `run_elf` |
 | [kernel/src/net/mod.rs](../kernel/src/net/mod.rs) | `NetConfig`（`10.0.2.15/24`）、IPv4/ARP/ICMP/UDP 协议栈与 `ping` / `send_udp` |
 | [kernel/src/fs/mod.rs](../kernel/src/fs/mod.rs) | 统一文件系统层：可读写 RAMFS 与根目录 `/disk/<8.3>` FAT32 持久化挂载（子目录写保护） |
 | [kernel/src/fs/fat32.rs](../kernel/src/fs/fat32.rs) | GPT (`EFI PART`, `ef00`) 与 FAT32 BPB/簇链/LFN+8.3 读写及根目录文件增删驱动 |
-| [kernel/src/arch/mod.rs](../kernel/src/arch/mod.rs) | 架构层导出：`cpu`、`gdt`、`idt`、`io`、`pic`、`pit`、`rtc`、`serial` |
+| [kernel/src/arch/mod.rs](../kernel/src/arch/mod.rs) | 架构层导出：`cpu`、`gdt`、`idt`、`io`、`pic`、`pit`、`rtc`、`serial`、`syscall` |
 | [kernel/src/arch/io.rs](../kernel/src/arch/io.rs) | 端口 I/O：`inb`、`outb`、`inw`、`outw`、`inl`、`outl` 与 `io_wait` |
 | [kernel/src/arch/cpu.rs](../kernel/src/arch/cpu.rs) | `cli`、`sti`、`hlt`、`sti_and_hlt`、`halt_loop`、`rdtsc`、`read_cr3`、`invlpg`、`reboot`、`shutdown` |
 | [kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs) | COM1 (`0x3F8`) 115200 8N1 串口驱动与 `serial_print!` / `serial_println!` |
-| [kernel/src/arch/gdt.rs](../kernel/src/arch/gdt.rs) | 64 位 GDT、`Tss` 与 16 KiB `DOUBLE_FAULT_STACK`（IST1） |
+| [kernel/src/arch/gdt.rs](../kernel/src/arch/gdt.rs) | 7 项 64 位 GDT（含 `USER_DS`/`USER_CS`）、`Tss`、`TSS_RSP0_STACK` 与 `DOUBLE_FAULT_STACK`（IST1） |
 | [kernel/src/arch/pic.rs](../kernel/src/arch/pic.rs) | 双 8259 PIC 重映射（`0x20`/`0x28`）、IRQ 掩码配置与 `send_eoi` |
 | [kernel/src/arch/pit.rs](../kernel/src/arch/pit.rs) | 8254 PIT 通道 0（100 Hz）全局滴答计数 |
 | [kernel/src/arch/rtc.rs](../kernel/src/arch/rtc.rs) | CMOS (`0x70`/`0x71`) 实时时钟 `RtcDateTime` 读取与 BCD/12h 解码 |
-| [kernel/src/arch/idt.rs](../kernel/src/arch/idt.rs) | 256 项 IDT、`global_asm!` 中断桩与 `isr_dispatch` 分发器 |
+| [kernel/src/arch/idt.rs](../kernel/src/arch/idt.rs) | 256 项 IDT、`global_asm!` 中断桩、`isr_dispatch` 与 CPL=3 用户态异常隔离恢复 |
+| [kernel/src/arch/syscall.rs](../kernel/src/arch/syscall.rs) | `IA32_EFER.SCE`/`STAR`/`LSTAR`/`FMASK` 配置、16 KiB `SYSCALL_STACK`、`global_asm!` 快速系统调用与用户态进出蹦床 |
 | [kernel/src/mem/mod.rs](../kernel/src/mem/mod.rs) | 内存管理导出：`heap`、`pmm`、`vmm` |
 | [kernel/src/mem/pmm.rs](../kernel/src/mem/pmm.rs) | 128 KiB 物理页帧位图分配器（最高 4 GiB）与 `PmmStats` |
-| [kernel/src/mem/vmm.rs](../kernel/src/mem/vmm.rs) | 4 级页表映射/解映射/地址翻译（支持 `WRITE_THROUGH` / `CACHE_DISABLE`）与自检 |
+| [kernel/src/mem/vmm.rs](../kernel/src/mem/vmm.rs) | 4 级页表映射/解映射、`USER_ACCESSIBLE`、`UserAddressSpace` 隔离与自检 |
 | [kernel/src/mem/heap.rs](../kernel/src/mem/heap.rs) | `HEAP_START` 内核堆映射、`#[global_allocator]` 与自检 |
 | [kernel/src/drivers/mod.rs](../kernel/src/drivers/mod.rs) | 设备驱动导出：`ahci`、`e1000`、`keyboard`、`mouse`、`pci`、`ps2` |
 | [kernel/src/drivers/pci.rs](../kernel/src/drivers/pci.rs) | PCI 配置空间（`0xCF8`/`0xCFC`）总线 `0..=7` 设备枚举（含 `bar0`/`bar5`）与厂商/类别映射 |
@@ -126,6 +134,8 @@ flowchart TD
 
 | 虚拟/物理地址空间 | 用途与容量参数 | 定义位置 |
 | :--- | :--- | :--- |
+| `0x0000_0000_0040_0000` .. `< 0x0000_7000_0000_0000` (`USER_ADDR_CEIL`) | Ring-3 用户态 ELF64 `PT_LOAD` 隔离映射区（低半部每进程独立 PML4 + `USER_ACCESSIBLE`） | [kernel/src/user/elf.rs](../kernel/src/user/elf.rs) |
+| `0x0000_7FFF_F000_0000` .. `0x0000_7FFF_F000_4000` (`USER_STACK_BASE`, 4 页 = 16 KiB) | Ring-3 用户态隔离栈区（初始 `USER_RSP_INIT = 0x0000_7FFF_F000_3FF0`，16 字节对齐） | [kernel/src/user/elf.rs](../kernel/src/user/elf.rs) |
 | `0x0000_0000_0010_0000` (`MIN_USABLE_PHYS`) .. `4 GiB` (`MAX_PHYS`) | PMM 4 KiB 页帧位图管理区（`[u64; 16384]` = 128 KiB，最多 `1_048_576` 帧，1 MiB 以下保留） | [kernel/src/mem/pmm.rs](../kernel/src/mem/pmm.rs) |
 | `0xffff_8000_0000_0000` (HHDM 基址) | Limine 物理内存直映区，供 VMM 访问四级页表及 AHCI 访问物理 DMA 帧 | [kernel/src/mem/vmm.rs](../kernel/src/mem/vmm.rs) |
 | `0xffff_9000_0000_0000` (`TEST_BASE`, 最多扫描 4096 页) | VMM `self_test()` 动态映射/写入 `0x574D_4F53_CAFE_BABE`/解映射测试虚址段 | [kernel/src/mem/vmm.rs](../kernel/src/mem/vmm.rs) |
@@ -154,7 +164,7 @@ sequenceDiagram
 
     Limine->>KMain: "Enter kmain() with HHDM, MemMap, FB"
     KMain->>KMain: "cli() + serial::init() -> [wmos] boot ok"
-    KMain->>Arch: "gdt::init() + pic::init() + idt::init()"
+    KMain->>Arch: "gdt::init() + pic::init() + idt::init() + syscall::init()"
     KMain->>Mem: "pmm::init() -> vmm::self_test() -> heap::init() + self_test()"
     KMain->>Arch: "rtc::read() -> [wmos] rtc ok"
     KMain->>FS: "fs::init() + self_test() -> [wmos] fs ok"
@@ -184,6 +194,7 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 | `[wmos] boot ok` | `main.rs` | COM1 初始化完成（BIOS/UEFI 必检） |
 | `[wmos] gdt+tss ok` | `main.rs` | 64 位 GDT、TSS 与 IST1 双重错误栈加载完成（BIOS/UEFI 必检） |
 | `[wmos] idt+pic ok` | `main.rs` | 双 8259 PIC 重映射与 256 项 IDT 加载完成（BIOS/UEFI 必检） |
+| `[wmos] syscall+ring3 ok` | `main.rs` | 7 项 GDT（含 Ring-3 段）及 `SYSCALL`/`SYSRET` MSR 配置完成（BIOS/UEFI 必检） |
 | `[wmos] pmm ok free=<n> total=<n> frames` | `main.rs` | PMM 位图初始化完成（BIOS/UEFI 必检前缀 `[wmos] pmm ok`） |
 | `[wmos] vmm self-test ok` | `main.rs` | VMM 4 级页表自检通过（BIOS/UEFI 必检） |
 | `[wmos] heap ok size=<kib> KiB` | `main.rs` | 内核堆映射与自由链表初始化完成（BIOS/UEFI 必检前缀 `[wmos] heap ok`） |
@@ -204,12 +215,15 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 | `[wmos] desktop rendered` | `main.rs` | 初始桌面、窗口、任务栏与光标渲染完成（BIOS/UEFI 必检） |
 | `[wmos] ready` | `main.rs` | 已执行 `sti()` 开启中断并进入主循环（BIOS/UEFI 必检） |
 | `[wmos] mouse active (<x>, <y>)` | `desktop.rs` | 首次收到鼠标有效数据包（UEFI 交互必检前缀 `[wmos] mouse active`） |
-| `[wmos] cmd: <cmd>` | `shell.rs` | 终端执行命令（UEFI Boot #1 必检 `lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`write /disk/persist.txt hello-v4`、`ifconfig`、`ping 10.0.2.2`、`open files`；Boot #2 冷重启必检 `cat /disk/persist.txt`） |
+| `[wmos] cmd: <cmd>` | `shell.rs` | 终端执行命令（UEFI Boot #1 必检 `lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`write /disk/persist.txt hello-v4`、`ifconfig`、`ping 10.0.2.2`、`exec /disk/bin/hello.elf`、`open files`；Boot #2 冷重启必检 `cat /disk/persist.txt`） |
 | `[wmos] fs cat <name> ok` | `shell.rs` | `cat` 成功读取 RAMFS 或 FAT32 磁盘文件（UEFI Boot #1 必检 `disk/boot/limine/limine.conf` 与 `demo.txt`；Boot #2 冷重启必检 `disk/persist.txt`） |
 | `[wmos] fs disk write <norm> ok (<B> B)` | `fs/mod.rs` | `write`/`append`/`touch` 成功写入根目录 `/disk/<8.3>` FAT32 文件并刷盘（UEFI Boot #1 必检前缀 `[wmos] fs disk write disk/persist.txt ok`） |
 | `[wmos] fs disk rm <norm> ok` | `fs/mod.rs` | `rm` 或 `FilesApp` 成功删除根目录 `/disk/<8.3>` FAT32 文件并释放簇链 |
 | `[wmos] ping <ip> ok rtt=<ms>ms` | `shell.rs` | `ping` 收到首个匹配 ICMP Echo Reply 并输出往返时间（UEFI Boot #1 必检前缀 `[wmos] ping 10.0.2.2 ok`） |
 | `[wmos] udp sent <ip>:<port>` | `shell.rs` | `udp` 命令成功通过 `net::send_udp` 发送 UDP/IPv4 数据报 |
+| `[wmos] user: <line>` | `syscall.rs` | Ring-3 用户程序通过 `SYS_WRITE` 输出的一行标准输出（UEFI Boot #1 必检 `Hello from WMOS Ring-3 ELF64 userland!` 与 `Syscall ABI verified (CPL=3 -> Ring 0 -> CPL=3).`） |
+| `[wmos] user elf exit=<code>` | `elf.rs` | Ring-3 ELF64 进程退出并回收地址空间（UEFI Boot #1 必检 `[wmos] user elf exit=0`） |
+| `[wmos] user fault vec=<v> err=<e> rip=<r>` | `idt.rs` | 捕获 CPL=3 用户态异常并隔离中止进程，不触发内核停机 |
 | `[wmos] notepad saved <name> (<n> B)` | `apps.rs` | `Notepad` 保存文件到 RAMFS 或根目录 `/disk/<8.3>` FAT32 磁盘 |
 | `[wmos] reboot requested` / `[wmos] poweroff requested` | `shell.rs` / `desktop.rs` | 触发重启或 ACPI 关机 |
 | `[wmos] EXCEPTION vec=<v> err=<e> rip=<r> rsp=<s>` | `idt.rs` | 捕获 CPU 异常 `0..=31` 并停机（BIOS/UEFI 严禁出现） |
@@ -219,15 +233,24 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 
 ## 5. 核心子系统详细设计
 
-### 5.1 架构层（`kernel/src/arch/`）
+### 5.1 架构层、7 项 GDT 与快速系统调用（`kernel/src/arch/`）
 
-- **16/32 位端口 I/O 与关机（[io.rs](../kernel/src/arch/io.rs), [cpu.rs](../kernel/src/arch/cpu.rs)）**：新增 `inw`/`outw`/`inl`/`outl` 供 PCI 与 ACPI 端口访问；`cpu::shutdown()` 关中断后依次向 QEMU/Bochs/VirtualBox ACPI 关机端口写入 `outw(0x604, 0x2000)`、`outw(0xB004, 0x2000)`、`outw(0x4004, 0x3400)`，未立即断电则进入 `halt_loop()`。`sti_and_hlt()` 原子开中断休眠。
-- **GDT/TSS、IDT、8259 PIC、PIT 与 CMOS RTC**：64 位 GDT + `16 KiB` `DOUBLE_FAULT_STACK`（IST1）、256 项 IDT + `global_asm!` 15 寄存器保存桩、8259 PIC 重映射 `0x20`/`0x28`（掩码 `0xF8`/`0xEF`）、100 Hz PIT（`11931`）、CMOS `0x70`/`0x71` 双读一致性 `RtcDateTime`。
+- **16/32 位端口 I/O 与关机（[io.rs](../kernel/src/arch/io.rs), [cpu.rs](../kernel/src/arch/cpu.rs)）**：`inw`/`outw`/`inl`/`outl` 供 PCI 与 ACPI 端口访问；`cpu::shutdown()` 关中断后依次向 QEMU/Bochs/VirtualBox ACPI 关机端口写入 `outw(0x604, 0x2000)`、`outw(0xB004, 0x2000)`、`outw(0x4004, 0x3400)`，未立即断电则进入 `halt_loop()`。`sti_and_hlt()` 原子开中断休眠。
+- **7 项 GDT/TSS 与用户态异常隔离（[gdt.rs](../kernel/src/arch/gdt.rs), [idt.rs](../kernel/src/arch/idt.rs)）**：
+  - `GDT` 扩展至 7 项以契合 x86_64 `STAR`/`SYSRETQ` 选择子顺序：`0x00` Null、`0x08` `KERNEL_CS`、`0x10` `KERNEL_DS`、`0x18` User Data（`USER_DS = 0x1B`）、`0x20` User Code（`USER_CS = 0x23`）、`0x28`/`0x30` 16 字节 TSS；`tss.rsp[0]` 指向 16 KiB `TSS_RSP0_STACK` 栈顶，`tss.ist[0]` 指向 16 KiB `DOUBLE_FAULT_STACK` 栈顶。
+  - 256 项 IDT + `global_asm!` 15 寄存器保存桩；`isr_dispatch` 对 `0..=31` 异常检测 `(frame.cs & 3) == 3`，若源于 CPL=3 用户态则打印 `[wmos] user fault vec=<v> err=<e> rip=<r>` 并调用 `syscall::abort_user_from_fault(-1)` 隔离终止用户进程而不触发内核停机；8259 PIC 重映射 `0x20`/`0x28`（掩码 `0xF8`/`0xEF`）、100 Hz PIT（`11931`）、CMOS `0x70`/`0x71` 双读一致性 `RtcDateTime`。
+- **Ring-3 `syscall`/`sysret` 与用户态进出蹦床（[syscall.rs](../kernel/src/arch/syscall.rs)）**：
+  - `init()` 置位 `IA32_EFER (0xC000_0080)` `SCE`（bit 0），设置 `IA32_STAR (0xC000_0081) = (0x0010 << 48) | (0x0008 << 32)`、`IA32_LSTAR (0xC000_0082) = syscall_entry` 与 `IA32_FMASK (0xC000_0084) = 0x200`（进入内核时屏蔽 `IF`）。
+  - 维护独立 16 KiB `SYSCALL_STACK`；`global_asm!` 中的 `syscall_entry` 保存用户 `rsp` 至 `USER_RSP_SCRATCH` 并切至 `SYSCALL_STACK_TOP`，重排 System V 参数 `(rax, rdi, rsi, rdx)` 调用 `syscall_dispatch(num, a1, a2, a3)` 后执行 `sysretq` 返回。
+  - 支持 4 个系统调用：`SYS_WRITE (1)`（`verify_user_readable` 检查 `< USER_ADDR_LIMIT = 0x0000_7FFF_FFFF_0000`、`len <= 4096` 与 `vmm::translate`，采集标准输出并逐行输出 `[wmos] user: <line>`）、`SYS_GETPID (20)`、`SYS_UPTIME (96)`、`SYS_EXIT (60)`（通过 `syscall_return_to_kernel` 切回 `KERNEL_CR3_VAL` 与 `KERNEL_SAVE_RSP`）。
+  - `enter_user_mode(entry_rip, user_rsp, user_cr3)` 经 `enter_user_trampoline` 切换至 `user_cr3` 并 `iretq` 进入 CPL=3，退出或异常中止后返回 `(exit_code, stdout)`。
 
-### 5.2 内存管理与内核堆（`kernel/src/mem/`）
+### 5.2 内存管理与独立用户地址空间（`kernel/src/mem/`）
 
 - **PMM（[pmm.rs](../kernel/src/mem/pmm.rs)）**：`IrqGuard` + `[u64; 16384]` 4 KiB 位图（`[0x10_0000, 4 GiB)`）。
-- **VMM（[vmm.rs](../kernel/src/mem/vmm.rs)）**：新增 `WRITE_THROUGH = 1 << 3` 与 `CACHE_DISABLE = 1 << 4` 页表标志，在 `map_page` 中允许 `(PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE)` 组合以支撑设备 MMIO 非缓存映射，并导出 `hhdm_offset()` 供 DMA 物理帧访问。
+- **VMM 与 `UserAddressSpace`（[vmm.rs](../kernel/src/mem/vmm.rs)）**：
+  - 支持 `USER_ACCESSIBLE = 1 << 2`、`WRITE_THROUGH = 1 << 3` 与 `CACHE_DISABLE = 1 << 4`；导出 `hhdm_offset()`、`kernel_cr3()` 与 `write_cr3()`。
+  - `UserAddressSpace` 通过 `create_user_space()` 分配独立 PML4，清零低半部 `0..256` 并复制内核高半部 `256..512`；`map_user_page` / `ensure_user_page` 按需分配并跟踪全部页表帧与用户数据帧至 `owned_frames`，`Drop` 时自动归还所有物理帧至 PMM。
 - **Heap（[heap.rs](../kernel/src/mem/heap.rs)）**：映射 `2 MiB .. 16 MiB` 于 `HEAP_START = 0xFFFF_A000_0000_0000`，`AllocHeader` 支持任意对齐无泄漏合并释放。
 
 ### 5.3 PCI 枚举、AHCI SATA DMA 与 Intel e1000 网卡驱动（`kernel/src/drivers/`）
@@ -289,42 +312,50 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
   - `poll()` 每轮从 `e1000::poll_recv` 排空最多 `16` 帧，自动学习对端 ARP 映射并自动回复目标为本机 `LOCAL_IP` 的 ARP Request 与 ICMP Echo Request。
   - `ping(target_ip, seq)` 构造 `ICMP_ECHO_ID = 0x574D` Echo Request 并轮询匹配回复（超时 `150` ticks），按 PIT `HZ` 换算并返回 `rtt_ms`；`send_udp(dst_ip, src_port, dst_port, payload)` 支持最大 `1472 B` 载荷的 UDP/IPv4 发送。
 
-### 5.7 主题系统、多窗口桌面、Apps 与升级版 Shell（`kernel/src/gfx/` & `kernel/src/shell.rs`）
+### 5.7 Ring-3 ELF64 加载器与用户态示例（[kernel/src/user/elf.rs](../kernel/src/user/elf.rs) & [user/hello.S](../user/hello.S)）
+
+- **ELF64 校验与加载（`elf.rs`）**：
+  - `run_elf(bytes)` 校验 `ELF64 LSB`、`e_type == 2` (`ET_EXEC`)、`e_machine == 62` (`EM_X86_64`) 与入口地址 `< USER_ADDR_CEIL (0x0000_7000_0000_0000)`。
+  - 遍历所有 `PT_LOAD` 程序头，校验 `p_memsz >= p_filesz` 与边界不越界，调用 `UserAddressSpace::ensure_user_page` 分配并清零物理帧后通过 HHDM 拷贝 `p_filesz` 字节；随后映射 `USER_STACK_PAGES = 4` 页（`16 KiB`）可写用户栈于 `0x0000_7FFF_F000_0000..0x0000_7FFF_F000_4000`（`USER_RSP_INIT = 0x0000_7FFF_F000_3FF0`）。
+  - 同步调用 `syscall::enter_user_mode`，执行结束后释放 `user_space`、打印 `[wmos] user elf exit=<code>` 并返回 `ExecOutput { exit_code, stdout }`。
+- **用户态汇编示例（[user/hello.S](../user/hello.S)）**：使用 freestanding x86_64 AT&T 汇编依次发起 `SYS_WRITE (1)`、`SYS_GETPID (20)`、`SYS_UPTIME (96)`、`SYS_WRITE (1)` 与 `SYS_EXIT (60)`，经 `gcc -nostdlib -static -no-pie -Wl,-Ttext=0x400000 -Wl,--build-id=none` 链接为 `dist/hello.elf` 并预装至光盘与 FAT32 磁盘 `/bin/hello.elf`。
+
+### 5.8 主题系统、多窗口桌面、Apps 与升级版 Shell（`kernel/src/gfx/` & `kernel/src/shell.rs`）
 
 - **主题切换（[color.rs](../kernel/src/gfx/color.rs)）**：定义 `Theme::{Dark, Ocean, Amber}` 与 `ThemePalette`（控制壁纸上下渐变、任务栏 Accent 按钮与活跃窗口标题栏/高亮边框）。
 - **5 窗口桌面与 Start 菜单（[desktop.rs](../kernel/src/gfx/desktop.rs), [apps.rs](../kernel/src/gfx/apps.rs), [ui.rs](../kernel/src/gfx/ui.rs)）**：
   - 5 个窗口：`0: System Info`、`1: WMOS Terminal`、`2: WMOS Paint`、`3: WMOS Notepad`、`4: WMOS Files`；任务栏动态水平排布所有非 `Closed` 标签（`Info`、`Term`、`Paint`、`Note`、`Files`）以免与右侧托盘重叠。
   - `WMOS` Start 菜单共 8 项：5 个应用入口、`Theme: <name>`（点击实时循环切换主题）、`Reboot System`、`Shutdown`。
   - `WMOS Files`（`FilesApp`）同时列出 `[RAM ]` 与 `[DISK]` 文件，底部状态提示区分 `FAT32 RW`（根目录 `/disk/<8.3>` 可读写/可删除）、`Protected`（`/disk/boot/` 等子目录受写保护不可写删）与 `RAMFS`；`Open` 打开至 `WMOS Notepad`（由 `is_disk_readonly_path` 判断，仅子目录或 `/disk` 自身设为 `ReadOnly`，根目录 `/disk/<8.3>` 支持 `Save`/`Clear` 落盘并在写失败时显示 `Error`）、`New` 新建 `note_<id>.txt`、`Del` 支持删除 RAMFS 与根目录 `/disk/<8.3>` 磁盘文件、`Refresh` 刷新列表。
-  - `System Info` 与桌面顶栏实时展示 `WMOS v4.1.0 // x86_64 AHCI FAT32 RW + e1000 Net + Desktop`、`wmos v4.1.0`、CMOS RTC、双缓冲状态、PMM/Heap 进度条、RAMFS + FAT32 文件数、PCI 设备与调度器切换数、实时 `Net` IPv4 与 TX/RX 包统计、KBD/MSE IRQ、鼠标坐标及当前主题。
-- **25 命令终端（[shell.rs](../kernel/src/shell.rs)）**：
-  - 在 `v4.0.0` 22 条命令基础上新增 `ifconfig`、`ping [ip]`（默认探测 `10.0.2.2`，连续发送 `seq 1..=3` 并输出 `[wmos] ping <ip> ok rtt=<ms>ms`）与 `udp <ip> <port> <msg>`（输出 `[wmos] udp sent <ip>:<port>`），同步更新 `COMMANDS` Tab 补全列表、`help`、`info` 与 `about` 至 `wmos v4.1.0`。
+  - `System Info` 与桌面顶栏实时展示 `WMOS v4.2.0 // x86_64 FAT32 RW + e1000 Net + Ring-3 ELF64`、`wmos v4.2.0`、CMOS RTC、双缓冲状态、PMM/Heap 进度条、RAMFS + FAT32 文件数、PCI 设备与调度器切换数、实时 `Net` IPv4 与 TX/RX 包统计、`Ring-3  : Syscall + ELF64 READY`、KBD/MSE IRQ、鼠标坐标及当前主题。
+- **26 命令终端（[shell.rs](../kernel/src/shell.rs)）**：
+  - 在 `v4.1.0` 25 条命令基础上新增 `exec <path>`（经 `fs::read` 读取静态 ELF64 并调用 `user::elf::run_elf` 同步展示 `stdout` 与退出码），同步更新 `COMMANDS` Tab 补全列表、`help`、`info` 与 `about` 至 `wmos v4.2.0`。
 
 ---
 
 ## 6. 构建、多格式镜像与云端 QEMU 校验体系
 
 - **CI 工作流（[.github/workflows/build.yml](../.github/workflows/build.yml)）**：在 `ubuntu-latest` 上编译内核、打包镜像、运行 `./scripts/verify-qemu.sh` 并上传 `wmos-images` 与 `wmos-ci-logs-and-preview`。
-- **镜像打包（[scripts/build-images.sh](../scripts/build-images.sh)）**：生成 Hybrid BIOS+UEFI `dist/wmos.iso`、64 MiB GPT（`ef02` 分区 1 `2048:4095` + `ef00` FAT32 分区 2 `4096:+60M`）`dist/wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt`。
-- **QEMU 双模式、外部磁盘镜像、冷重启与网络校验（[scripts/verify-qemu.sh](../scripts/verify-qemu.sh)）**：
-  - **`[1/3]` Legacy BIOS**：`dist/wmos.iso` 校验全部 17 项启动/初始化标记且无 `PANIC`/`EXCEPTION`。
-  - **`[2/3]` UEFI (OVMF) Boot #1 + AHCI 写入 + e1000 网络 + `mtype` 校验**：复制 `dist/wmos.img` 为 `dist/wmos-persist-test.img` 并与 `-cdrom dist/wmos.iso` 及 `-netdev user,id=net0 -device e1000,netdev=net0` 一同挂载，通过 `/tmp/wmos-mon.sock` 发送 `mouse_move 40 25` 与 10 条交互操作（`lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`cat demo.txt`、`write /disk/persist.txt hello-v4`、`ifconfig`、`ping 10.0.2.2`、`open files`），断言 `[wmos] ahci ok disks=1`、`[wmos] disk fat32 ok`、`[wmos] e1000 ok mac=`、`[wmos] net ok ip=10.0.2.15`、`[wmos] mouse active`、`[wmos] fs disk write disk/persist.txt ok`、`[wmos] cmd: ifconfig`、`[wmos] cmd: ping 10.0.2.2`、`[wmos] ping 10.0.2.2 ok` 及全部命令标记并导出 `dist/boot-preview.png`；随后在宿主侧运行 `mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT` 校验文件内容确含 `hello-v4`。
-  - **`[3/3]` UEFI (OVMF) Boot #2 冷重启持久化验证**：关停首个 QEMU 实例后再次冷启动 QEMU（日志输出至 `dist/qemu-uefi-reboot.log`），继续挂载同一 `dist/wmos-persist-test.img`，注入 `cat /disk/persist.txt`，断言全部 17 项基础启动标记与 `[wmos] fs cat disk/persist.txt ok` 均存在且无 `PANIC`/`EXCEPTION`，并在退出前清理临时镜像 `dist/wmos-persist-test.img`。
+- **镜像打包（[scripts/build-images.sh](../scripts/build-images.sh)）**：先将 `user/hello.S` 静态汇编链接为 `dist/hello.elf` 并拷贝至 `iso_root/bin/hello.elf` 与 `::/bin/hello.elf`，随后生成 Hybrid BIOS+UEFI `dist/wmos.iso`、64 MiB GPT（`ef02` 分区 1 `2048:4095` + `ef00` FAT32 分区 2 `4096:+60M`）`dist/wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt`。
+- **QEMU 双模式、外部磁盘镜像、冷重启、网络与 Ring-3 校验（[scripts/verify-qemu.sh](../scripts/verify-qemu.sh)）**：
+  - **`[1/3]` Legacy BIOS**：`dist/wmos.iso` 校验全部 18 项启动/初始化标记（含 `[wmos] syscall+ring3 ok`）且无 `PANIC`/`EXCEPTION`。
+  - **`[2/3]` UEFI (OVMF) Boot #1 + AHCI 写入 + e1000 网络 + Ring-3 ELF64 + `mtype` 校验**：复制 `dist/wmos.img` 为 `dist/wmos-persist-test.img` 并与 `-cdrom dist/wmos.iso` 及 `-netdev user,id=net0 -device e1000,netdev=net0` 一同挂载，通过 `/tmp/wmos-mon.sock` 发送 `mouse_move 40 25` 与 11 条交互操作（`lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`cat demo.txt`、`write /disk/persist.txt hello-v4`、`ifconfig`、`ping 10.0.2.2`、`exec /disk/bin/hello.elf`、`open files`），断言 `[wmos] ahci ok disks=1`、`[wmos] disk fat32 ok`、`[wmos] e1000 ok mac=`、`[wmos] net ok ip=10.0.2.15`、`[wmos] mouse active`、`[wmos] fs disk write disk/persist.txt ok`、`[wmos] cmd: ifconfig`、`[wmos] cmd: ping 10.0.2.2`、`[wmos] ping 10.0.2.2 ok`、`[wmos] cmd: exec /disk/bin/hello.elf`、`[wmos] user: Hello from WMOS Ring-3 ELF64 userland!`、`[wmos] user: Syscall ABI verified (CPL=3 -> Ring 0 -> CPL=3).`、`[wmos] user elf exit=0` 及全部命令标记并导出 `dist/boot-preview.png`；随后在宿主侧运行 `mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT` 校验文件内容确含 `hello-v4`。
+  - **`[3/3]` UEFI (OVMF) Boot #2 冷重启持久化验证**：关停首个 QEMU 实例后再次冷启动 QEMU（日志输出至 `dist/qemu-uefi-reboot.log`），继续挂载同一 `dist/wmos-persist-test.img`，注入 `cat /disk/persist.txt`，断言全部 18 项基础启动标记与 `[wmos] fs cat disk/persist.txt ok` 均存在且无 `PANIC`/`EXCEPTION`，并在退出前清理临时镜像 `dist/wmos-persist-test.img`。
 
 ---
 
 ## 7. 已知边界与后续演进路线
 
-### 当前已知边界（`v4.1.0`）
+### 当前已知边界（`v4.2.0`）
 
+- **用户态同步执行与系统调用集**：当前 `exec <path>` 为同步阻塞执行静态 `ET_EXEC` ELF64（暂不支持动态链接、用户态抢占调度或多进程并发后台运行），提供 `SYS_WRITE`、`SYS_GETPID`、`SYS_UPTIME`、`SYS_EXIT` 4 个基础系统调用。
 - **FAT32 写入范围限定**：当前 FAT32 写入与删除限定为根目录 `/disk/<8.3>` 文件（不支持长文件名 LFN 写入与新建子目录）；`/disk/boot/` 与 `/disk/EFI/` 等子目录维持只读保护以保障引导文件安全；RAMFS 仍仅驻留内存不落盘。
-- **静态网络配置与传输层范围**：当前仅支持 Intel e1000/e1000e 轮询模式与静态 IPv4 (`10.0.2.15/24`) + ARP/ICMP/UDP 发送，尚未支持 DHCP、DNS、TCP 状态机或 e1000 中断驱动收包。
-- **单核、协作调度与全内核态运行**：仅运行于引导处理器（BSP），3 个内核任务采用协作式 `yield_now()` 切换；所有窗口与应用运行在 Ring 0，PMM 位图固定覆盖最高 `4 GiB` 物理内存。
+- **静态网络配置与单核协作调度**：当前仅支持 Intel e1000/e1000e 轮询模式与静态 IPv4 (`10.0.2.15/24`) + ARP/ICMP/UDP 发送（尚未支持 DHCP/DNS/TCP）；内核仅运行于 BSP 单核协作式调度且 PMM 位图固定覆盖最高 `4 GiB`。
 
 ### 后续演进路线
 
-- **第 1 梯队（抢占调度与多核 SMP）**：接入 Local APIC / IOAPIC 与 ACPI MADT 解析，开启 AP 多核及定时器驱动的抢占式线程调度。
-- **第 2 梯队（Ring 3 用户态与系统调用）**：配置 GDT Ring 3 段与 `TSS.rsp[0]`，实现独立进程页表、ELF 用户程序加载及 `syscall/sysret` 系统调用。
+- **第 1 梯队（抢占调度与多核 SMP）**：接入 Local APIC / IOAPIC 与 ACPI MADT 解析，开启 AP 多核及定时器驱动的抢占式线程/用户进程调度。
+- **第 2 梯队（扩展用户态 POSIX ABI 与进程管理）**：增加 `read` / `open` / `close` / `brk` / `mmap` / `spawn` / `waitpid` 系统调用及用户态 C/Rust SDK。
 - **第 3 梯队（完整 FAT32 目录树与完整 TCP/IP 协议栈）**：为 FAT32 扩展 LFN 长文件名写入与子目录创建/删除能力，并在网络栈补齐 DHCP、DNS 与 TCP 客户端/服务端。
 
 ---

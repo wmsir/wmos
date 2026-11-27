@@ -169,11 +169,12 @@ if os.path.exists(sock_path):
             "write /disk/persist.txt hello-v4",
             "ifconfig",
             "ping 10.0.2.2",
+            "exec /disk/bin/hello.elf",
             "open files",
         ):
             send_command(s, cmd)
 
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             if os.path.exists(uefi_log_path):
                 with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
@@ -181,6 +182,7 @@ if os.path.exists(sock_path):
                     if (
                         "[wmos] fs disk write disk/persist.txt ok" in content
                         and "[wmos] ping 10.0.2.2 ok" in content
+                        and "[wmos] user elf exit=0" in content
                         and "[wmos] cmd: open files" in content
                     ):
                         break
@@ -296,6 +298,7 @@ assert_log() {
         "[wmos] boot ok"
         "[wmos] gdt+tss ok"
         "[wmos] idt+pic ok"
+        "[wmos] syscall+ring3 ok"
         "[wmos] pmm ok"
         "[wmos] vmm self-test ok"
         "[wmos] heap ok"
@@ -340,6 +343,10 @@ for uefi_marker in \
     "[wmos] cmd: ifconfig" \
     "[wmos] cmd: ping 10.0.2.2" \
     "[wmos] ping 10.0.2.2 ok" \
+    "[wmos] cmd: exec /disk/bin/hello.elf" \
+    "[wmos] user: Hello from WMOS Ring-3 ELF64 userland!" \
+    "[wmos] user: Syscall ABI verified (CPL=3 -> Ring 0 -> CPL=3)." \
+    "[wmos] user elf exit=0" \
     "[wmos] cmd: open files"
 do
     if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
@@ -457,8 +464,8 @@ if ! grep -qF "[wmos] fs cat disk/persist.txt ok" "dist/qemu-uefi-reboot.log"; t
 fi
 
 echo "=== Verification Summary ==="
-echo "BIOS log: PASSED (all 17 required markers present, no PANIC/EXCEPTION)"
-echo "UEFI Boot #1 log: PASSED (all 17 + interactive + FAT32 disk write + e1000/ping markers present)"
+echo "BIOS log: PASSED (all 18 required markers present, no PANIC/EXCEPTION)"
+echo "UEFI Boot #1 log: PASSED (all 18 + interactive + FAT32 write + e1000/ping + Ring-3 ELF64 markers present)"
 echo "mtools check: PASSED (::/PERSIST.TXT contains 'hello-v4')"
 echo "UEFI Boot #2 (cold reboot): PASSED ('[wmos] fs cat disk/persist.txt ok', no PANIC/EXCEPTION)"
 if [[ -f dist/boot-preview.png ]]; then

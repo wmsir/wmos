@@ -2,12 +2,11 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 
-use crate::arch::{cpu, pic, pit};
+use crate::arch::{cpu, gdt, pic, pit, syscall};
 use crate::drivers::{keyboard, mouse};
 use crate::serial_println;
 
 const IDT_ENTRIES: usize = 256;
-const KERNEL_CS: u16 = 0x08;
 const GATE_INTERRUPT: u8 = 0x8E;
 
 #[repr(C, packed)]
@@ -38,7 +37,7 @@ impl IdtEntry {
     fn new(handler: u64, ist: u8) -> Self {
         Self {
             offset_low: (handler & 0xFFFF) as u16,
-            selector: KERNEL_CS,
+            selector: gdt::KERNEL_CS,
             ist,
             type_attr: GATE_INTERRUPT,
             offset_mid: ((handler >> 16) & 0xFFFF) as u16,
@@ -284,6 +283,15 @@ pub extern "C" fn isr_dispatch(frame: &InterruptFrame) {
             pic::send_eoi((frame.vector - 32) as u8);
         }
         0..=31 => {
+            if (frame.cs & 3) == 3 {
+                serial_println!(
+                    "[wmos] user fault vec={} err={:#x} rip={:#x}",
+                    frame.vector,
+                    frame.error_code,
+                    frame.rip
+                );
+                syscall::abort_user_from_fault(-1);
+            }
             serial_println!(
                 "[wmos] EXCEPTION vec={} err={:#x} rip={:#x} rsp={:#x}",
                 frame.vector,

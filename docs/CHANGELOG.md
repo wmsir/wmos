@@ -1,6 +1,6 @@
 # WMOS 变更日志 (CHANGELOG)
 
-记录 WMOS 从初始引导原型到 `v4.1.0` 及后续演进的全部里程碑与代码级变更。
+记录 WMOS 从初始引导原型到 `v4.2.0` 及后续演进的全部里程碑与代码级变更。
 
 ---
 
@@ -18,7 +18,29 @@
 
 ---
 
+## [v4.2.0] - 2026-11-27
+
+- **变更类型**：`feat` / `ci` / `docs`
+- **改动文件**：
+  - 架构、系统调用与地址空间隔离：`kernel/src/arch/{gdt.rs,idt.rs,mod.rs,syscall.rs}`、`kernel/src/mem/vmm.rs`
+  - 用户态 ELF64 加载器与入口：`kernel/src/user/{mod.rs,elf.rs}`、`kernel/src/main.rs`
+  - 终端、桌面与用户态汇编：`kernel/src/shell.rs`、`kernel/src/gfx/desktop.rs`、`user/hello.S`
+  - 打包、验证与文档：`scripts/build-images.sh`、`scripts/verify-qemu.sh`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
+- **变更摘要**：
+  - **7 项 GDT 与 Ring-3 异常隔离 (`arch/gdt.rs` & `arch/idt.rs`)**：GDT 扩展至 7 项（`0x00` Null、`0x08` `KERNEL_CS`、`0x10` `KERNEL_DS`、`0x18`/`0x1B` `USER_DS`、`0x20`/`0x23` `USER_CS`、`0x28`/`0x30` 16 字节 TSS），新增 16 KiB `TSS_RSP0_STACK` 绑定 `tss.rsp[0]`；`isr_dispatch` 对 `(frame.cs & 3) == 3` 的 CPL=3 异常打印 `[wmos] user fault vec=<v> err=<e> rip=<r>` 并调用 `syscall::abort_user_from_fault(-1)` 安全回退，不导致内核停机。
+  - **独立用户地址空间 (`mem/vmm.rs`)**：新增 `USER_ACCESSIBLE (1 << 2)`、`kernel_cr3()`、`write_cr3()` 与 `UserAddressSpace`（复制高半核 `256..512`、清零低半部 `0..256`，通过 `map_user_page` / `ensure_user_page` 按需分配并跟踪全部数据与页表帧，退出时 `Drop` 自动释放）。
+  - **`syscall`/`sysret` 快速系统调用与用户态切换 (`arch/syscall.rs`)**：配置 `IA32_EFER.SCE`、`IA32_STAR = (0x0010 << 48) | (0x0008 << 32)`、`IA32_LSTAR` 与 `IA32_FMASK = 0x200`；采用专用 16 KiB `SYSCALL_STACK` 与 `global_asm!` `syscall_entry` / `enter_user_trampoline` / `syscall_return_to_kernel` 实现 `SYS_WRITE (1)`（带 `USER_ADDR_LIMIT` 边界及页映射校验并输出 `[wmos] user: <line>`）、`SYS_GETPID (20)`、`SYS_EXIT (60)`、`SYS_UPTIME (96)`；`main.rs` 初始化后输出 `[wmos] syscall+ring3 ok`。
+  - **ELF64 加载器与终端/桌面集成 (`user/elf.rs`、`shell.rs` & `gfx/desktop.rs`)**：实现 `ExecOutput` 与 `run_elf(bytes)`，校验 `ET_EXEC` / `EM_X86_64`、`PT_LOAD` 边界并映射 16 KiB 用户栈（`0x0000_7FFF_F000_0000..+0x4000`），同步运行后输出 `[wmos] user elf exit=<code>`；终端扩展至 26 条命令并新增 `exec <path>`，桌面顶栏与 `System Info` 升级至 `wmos v4.2.0` 并新增 `Ring-3  : Syscall + ELF64 READY`。
+  - **用户态示例与 CI 闭环验证 (`user/hello.S` & `scripts/*.sh`)**：新增 AT&T 汇编 `user/hello.S`（调用 `SYS_WRITE`、`SYS_GETPID`、`SYS_UPTIME`、`SYS_EXIT`），由 `build-images.sh` 静态链接为 `dist/hello.elf`（`0x400000`）并打包至 ISO `/bin/hello.elf` 与磁盘 `::/bin/hello.elf`；`verify-qemu.sh` 在 BIOS/UEFI 双模式必检 `[wmos] syscall+ring3 ok`，并在 UEFI Boot #1 注入 `exec /disk/bin/hello.elf` 严格断言用户态输出与 `[wmos] user elf exit=0`。
+- **验证结果**：
+  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `425656` B，`e_entry=0xffffffff80023bc0`）；`user/hello.S` 汇编检查通过，`scripts/*.sh` 纯 LF 与零禁用标记检查通过。
+  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端编译、ELF64 链接打包与 QEMU 全流程验证。
+
+---
+
 ## [v4.1.0] - 2026-11-27
+
+### `5498275` — Intel e1000 网卡 DMA 驱动、IPv4/ARP/ICMP/UDP 协议栈与 `ping`/`ifconfig` CI 验证
 
 - **变更类型**：`feat` / `ci` / `docs`
 - **改动文件**：
@@ -33,8 +55,7 @@
   - **Shell 网络命令与 `System Info` 集成 (`shell.rs` & `gfx/desktop.rs`)**：终端扩展至 `25` 条命令，新增 `ifconfig`、`ping [ip]`（发送 3 次 ICMP 探测并输出 `[wmos] ping <ip> ok rtt=<ms>ms`）与 `udp <ip> <port> <msg>`（输出 `[wmos] udp sent <ip>:<port>`）；桌面顶栏与 `System Info` 升级至 `wmos v4.1.0` 并实时展示 `Net` IPv4 与 TX/RX 包统计。
   - **CI e1000 + `ping` 闭环验证 (`scripts/verify-qemu.sh`)**：UEFI Boot #1 挂载 `-netdev user,id=net0 -device e1000,netdev=net0`，注入 `ifconfig` 与 `ping 10.0.2.2` 并严格断言 `[wmos] e1000 ok mac=`、`[wmos] net ok ip=10.0.2.15`、`[wmos] cmd: ifconfig`、`[wmos] cmd: ping 10.0.2.2` 及 `[wmos] ping 10.0.2.2 ok`，完整保留 BIOS、FAT32 写入、`mtype` 与 Boot #2 冷重启检查。
 - **验证结果**：
-  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `392184` B，`e_entry=0xffffffff80024ab0`），`scripts/*.sh` 纯 LF 与零禁用标记检查通过。
-  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端 BIOS/UEFI + SATA 持久化 + e1000 网络交互验证。
+  - GitHub Actions Run [`45991687075`](https://github.com/wmsir/wmos/actions/runs/45991687075) 全绿通过（BIOS + UEFI Boot #1 `[wmos] e1000 ok mac=52:54:00:12:34:56`、`[wmos] ping 10.0.2.2 ok rtt=10ms` + `mtype ::/PERSIST.TXT => hello-v4` + Boot #2 冷重启 `[wmos] fs cat disk/persist.txt ok` 全部通过，产出 `wmos-images` `3576527` B 与 `wmos-ci-logs-and-preview` `18018` B）。
 
 ---
 

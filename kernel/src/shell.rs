@@ -11,6 +11,7 @@ use crate::gfx::color::{self, Color, Theme};
 use crate::mem::{heap, pmm, vmm};
 use crate::net;
 use crate::task::{self, TaskState};
+use crate::user::elf;
 
 const MAX_LINES: usize = 64;
 const MAX_HISTORY: usize = 64;
@@ -18,10 +19,10 @@ const MAX_INPUT_LEN: usize = 96;
 const MIB: u64 = 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
-const COMMANDS: [&str; 25] = [
+const COMMANDS: [&str; 26] = [
     "help", "info", "mem", "date", "uptime", "ls", "cat", "write", "append", "touch", "rm",
-    "stat", "open", "lspci", "ps", "disks", "ifconfig", "ping", "udp", "theme", "echo", "clear",
-    "about", "reboot", "poweroff",
+    "stat", "open", "exec", "lspci", "ps", "disks", "ifconfig", "ping", "udp", "theme", "echo",
+    "clear", "about", "reboot", "poweroff",
 ];
 
 const APP_NAMES: [&str; 5] = ["info", "term", "paint", "notepad", "files"];
@@ -302,12 +303,12 @@ impl TerminalState {
                 color::TERM_GREEN,
             );
             self.push_line(
-                "Apps: open <info|term|paint|notepad|files>, echo, clear, about",
+                "Apps: open <info|term|paint|notepad|files>, exec <path>, echo, clear, about",
                 color::TEXT_MUTED,
             );
         } else if cmd == "info" {
             self.push_line(
-                "OS: wmos v4.1.0 | Arch: x86_64 (Rust no_std)",
+                "OS: wmos v4.2.0 | Arch: x86_64 (Rust no_std)",
                 color::TEXT_PRIMARY,
             );
             self.push_line(
@@ -737,6 +738,29 @@ impl TerminalState {
                     }
                 }
             }
+        } else if cmd == "exec" {
+            self.push_line("Usage: exec <path>", color::TERM_AMBER);
+        } else if let Some(arg) = cmd.strip_prefix("exec ") {
+            let path = arg.trim();
+            match fs::read(path) {
+                None => {
+                    self.push_line(&format!("File not found: '{}'", path), color::DOT_RED);
+                }
+                Some(bytes) => match elf::run_elf(&bytes) {
+                    Ok(out) => {
+                        for line in out.stdout.lines() {
+                            self.push_line(line, color::TERM_GREEN);
+                        }
+                        self.push_line(
+                            &format!("Process exited with code {}", out.exit_code),
+                            color::TERM_CYAN,
+                        );
+                    }
+                    Err(msg) => {
+                        self.push_line(msg, color::DOT_RED);
+                    }
+                },
+            }
         } else if cmd == "echo" {
             self.push_line("", color::TEXT_PRIMARY);
         } else if let Some(rest) = cmd.strip_prefix("echo ") {
@@ -745,11 +769,11 @@ impl TerminalState {
             self.lines.clear();
         } else if cmd == "about" {
             self.push_line(
-                "wmos v4.1.0 - Minimal x86_64 Rust no_std OS",
+                "wmos v4.2.0 - Minimal x86_64 Rust no_std OS",
                 color::TERM_CYAN,
             );
             self.push_line(
-                "GDT/IDT/PMM/VMM/Heap + PCI/AHCI/FAT32 + e1000/Net + Double-Buf GUI",
+                "GDT/IDT/PMM/VMM/Heap + PCI/AHCI/FAT32 + e1000/Net + Ring-3 ELF64",
                 color::TEXT_MUTED,
             );
         } else if cmd == "reboot" {

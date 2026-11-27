@@ -2,16 +2,27 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 
-const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+const STACK_SIZE: usize = 16 * 1024;
+
+pub const KERNEL_CS: u16 = 0x08;
+#[allow(dead_code)]
+pub const KERNEL_DS: u16 = 0x10;
+#[allow(dead_code)]
+pub const USER_DS: u16 = 0x1B;
+#[allow(dead_code)]
+pub const USER_CS: u16 = 0x23;
 
 #[repr(C, align(16))]
-struct IstStack([u8; DOUBLE_FAULT_STACK_SIZE]);
+struct AlignedStack([u8; STACK_SIZE]);
 
 struct SyncCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
-static DOUBLE_FAULT_STACK: SyncCell<IstStack> =
-    SyncCell(UnsafeCell::new(IstStack([0; DOUBLE_FAULT_STACK_SIZE])));
+static DOUBLE_FAULT_STACK: SyncCell<AlignedStack> =
+    SyncCell(UnsafeCell::new(AlignedStack([0; STACK_SIZE])));
+
+static TSS_RSP0_STACK: SyncCell<AlignedStack> =
+    SyncCell(UnsafeCell::new(AlignedStack([0; STACK_SIZE])));
 
 #[repr(C, packed)]
 struct Tss {
@@ -34,12 +45,14 @@ static TSS: SyncCell<Tss> = SyncCell(UnsafeCell::new(Tss {
     iomap_base: size_of::<Tss>() as u16,
 }));
 
-static GDT: SyncCell<[u64; 5]> = SyncCell(UnsafeCell::new([
+static GDT: SyncCell<[u64; 7]> = SyncCell(UnsafeCell::new([
     0x0000_0000_0000_0000, // 0x00: Null
     0x00AF_9A00_0000_FFFF, // 0x08: Kernel 64-bit Code
     0x00CF_9200_0000_FFFF, // 0x10: Kernel Data
-    0,                     // 0x18: TSS low
-    0,                     // 0x20: TSS high
+    0x00CF_F200_0000_FFFF, // 0x18: User Data (RPL 3 -> 0x1B)
+    0x00AF_FA00_0000_FFFF, // 0x20: User 64-bit Code (RPL 3 -> 0x23)
+    0,                     // 0x28: TSS low
+    0,                     // 0x30: TSS high
 ]));
 
 #[repr(C, packed)]
@@ -48,14 +61,15 @@ struct Gdtr {
     base: u64,
 }
 
-/// Initializes the 64-bit GDT and TSS with IST1 double-fault stack, and reloads segments.
+/// Initializes the 7-entry 64-bit GDT and TSS (`rsp[0]` + `ist[0]`), and reloads segments.
 pub fn init() {
     unsafe {
-        let stack_base = DOUBLE_FAULT_STACK.0.get() as u64;
-        let stack_top = stack_base + DOUBLE_FAULT_STACK_SIZE as u64;
+        let df_top = (DOUBLE_FAULT_STACK.0.get() as u64) + STACK_SIZE as u64;
+        let rsp0_top = (TSS_RSP0_STACK.0.get() as u64) + STACK_SIZE as u64;
 
         let tss = &mut *TSS.0.get();
-        tss.ist[0] = stack_top;
+        tss.rsp[0] = rsp0_top;
+        tss.ist[0] = df_top;
         tss.iomap_base = size_of::<Tss>() as u16;
 
         let tss_base = TSS.0.get() as u64;
@@ -69,11 +83,11 @@ pub fn init() {
         let tss_high = (tss_base >> 32) & 0xFFFF_FFFF;
 
         let gdt = &mut *GDT.0.get();
-        gdt[3] = tss_low;
-        gdt[4] = tss_high;
+        gdt[5] = tss_low;
+        gdt[6] = tss_high;
 
         let gdtr = Gdtr {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: GDT.0.get() as u64,
         };
 
@@ -90,7 +104,7 @@ pub fn init() {
             "mov fs, ax",
             "mov gs, ax",
             "mov ss, ax",
-            "mov ax, 0x18",
+            "mov ax, 0x28",
             "ltr ax",
             gdtr = in(reg) &gdtr,
             out("rax") _,

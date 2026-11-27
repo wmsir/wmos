@@ -12,6 +12,7 @@ mod mem;
 mod net;
 mod shell;
 mod task;
+mod user;
 
 use core::panic::PanicInfo;
 
@@ -61,6 +62,9 @@ pub extern "C" fn kmain() -> ! {
     arch::pic::init();
     arch::idt::init();
     serial_println!("[wmos] idt+pic ok");
+
+    arch::syscall::init();
+    serial_println!("[wmos] syscall+ring3 ok");
 
     let hhdm_response = HHDM_REQUEST
         .get_response()
