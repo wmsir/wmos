@@ -10,7 +10,7 @@ if [[ ! -f "dist/wmos.iso" || ! -f "dist/wmos.img" ]]; then
     exit 1
 fi
 
-rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/qemu-uefi-reboot.log dist/iot-mock.log dist/wmos-persist-test.img dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock /tmp/wmos-mcu.sock
+rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/qemu-uefi-reboot.log dist/iot-mock.log dist/wmos-persist-test.img dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock /tmp/wmos-mcu.sock /tmp/wmos-mcu.ready
 
 echo "=== [1/3] Verifying dist/wmos.iso in QEMU Legacy BIOS mode ==="
 set +e
@@ -66,7 +66,7 @@ stop_mock() {
         wait "${MOCK_PID}" 2>/dev/null || true
     fi
     MOCK_PID=""
-    rm -f /tmp/wmos-mcu.sock
+    rm -f /tmp/wmos-mcu.sock /tmp/wmos-mcu.ready
 }
 stop_qemu() {
     if [[ -n "${QEMU_PID}" ]] && kill -0 "${QEMU_PID}" 2>/dev/null; then
@@ -205,15 +205,26 @@ def run_udp_server() -> None:
 
 def run_mcu_client() -> None:
     mcu_sock = "/tmp/wmos-mcu.sock"
-    for _ in range(120):
-        if os.path.exists(mcu_sock):
-            break
-        time.sleep(0.1)
-    if not os.path.exists(mcu_sock):
+    uefi_log = "dist/qemu-uefi.log"
+    ready_flag = "/tmp/wmos-mcu.ready"
+    kernel_ready = False
+    for _ in range(400):
+        if os.path.exists(uefi_log) and os.path.exists(mcu_sock):
+            try:
+                with open(uefi_log, "r", encoding="utf-8", errors="replace") as lf:
+                    if "[wmos] ready" in lf.read():
+                        kernel_ready = True
+                        break
+            except OSError:
+                pass
+        time.sleep(0.05)
+    if not kernel_ready:
         return
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.connect(mcu_sock)
+            with open(ready_flag, "w", encoding="utf-8") as rf:
+                rf.write("ok\n")
             buf = b""
             while True:
                 chunk = s.recv(1024)
@@ -223,7 +234,7 @@ def run_mcu_client() -> None:
                 while b"\n" in buf:
                     raw_line, buf = buf.split(b"\n", 1)
                     line = raw_line.decode("utf-8", errors="replace").strip()
-                    if line:
+                    if line and "\x1b" not in line:
                         log_event(f"MCU {line}")
                         s.sendall(b"TEMP=24C LED=ON\n")
     except OSError:
@@ -317,6 +328,10 @@ def send_command(sock: socket.socket, text: str) -> None:
     time.sleep(0.07)
 
 if os.path.exists(sock_path):
+    for _ in range(40):
+        if os.path.exists("/tmp/wmos-mcu.ready"):
+            break
+        time.sleep(0.05)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(2.0)
         s.connect(sock_path)
