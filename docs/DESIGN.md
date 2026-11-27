@@ -1,4 +1,4 @@
-# WMOS (`v4.2.0`) 系统设计与架构文档
+# WMOS (`v5.0.0`) 系统设计与架构文档
 
 > 本文档严格对应仓库当前实现代码，所有地址、常数、数据结构、中断向量、串口标记与构建/验证流程均以实际源码为准。
 
@@ -6,7 +6,7 @@
 
 ## 1. 项目概览与工程定位
 
-**WMOS**（crate `wmos-kernel` v0.1.0 / 里程碑 `v4.2.0`）是一个基于 **Rust Stable (`#![no_std]`, `#![no_main]`, `edition = "2021"`)** 与 **Limine v10 引导协议** 构建的独立 `x86_64` 微内核桌面操作系统。
+**WMOS**（crate `wmos-kernel` v0.1.0 / 里程碑 `v5.0.0`）是一个基于 **Rust Stable (`#![no_std]`, `#![no_main]`, `edition = "2021"`)** 与 **Limine v10 引导协议** 构建的独立 `x86_64` 微内核桌面操作系统。
 
 - **工程与工具链约束**：
   - 锁定工具链 `channel = "stable"`，目标三元组 `x86_64-unknown-none`（见 [rust-toolchain.toml](../rust-toolchain.toml)）。
@@ -27,18 +27,21 @@
 flowchart TD
     Boot["Limine v10 Bootloader\n(BIOS / UEFI)"] --> Entry["kmain\nkernel/src/main.rs"]
     Entry --> BootInfo["BootSummary / FramebufferInfo\nkernel/src/boot_info.rs"]
-    Entry --> Arch["Arch Layer\ngdt / idt / syscall / pic / pit / rtc / serial / cpu / io"]
+    Entry --> Arch["Arch Layer\ngdt / idt / syscall / serial(COM1+COM2) / pic / pit / rtc"]
     Entry --> Mem["Memory Layer\npmm / vmm (UserAddressSpace) / heap"]
     Entry --> Drivers["Drivers Layer\npci / ahci (SATA RW) / e1000 (NIC DMA) / ps2 / kbd / mouse"]
     Entry --> FS["Storage Layer\nRAMFS + FAT32 RW /disk/ (kernel/src/fs/{mod,fat32}.rs)"]
     Entry --> Task["Cooperative Scheduler\nkernel/src/task/mod.rs (3 Tasks)"]
-    Entry --> Net["Network Layer\nARP / ICMP / UDP (kernel/src/net/mod.rs)"]
+    Entry --> Net["Network Layer\nARP / DHCP / ICMP / UDP / TCP+HTTP+MQTT"]
+    Entry --> IoT["IoT Hub Layer\nHTTP / MQTT / UDP / COM2 UART (kernel/src/iot/mod.rs)"]
     Entry --> User["Ring-3 Userland\nELF64 Loader + user/hello.S (kernel/src/user/elf.rs)"]
     Entry --> Loop["Low-Power Event Loop\nnet::poll() + yield_now() + sti_and_hlt()"]
 
     Drivers --> FS
     Drivers --> Net
     Drivers --> Loop
+    Net --> IoT
+    Arch --> IoT
     Net --> Loop
     Arch --> User
     Mem --> User
@@ -46,17 +49,21 @@ flowchart TD
     Task --> Loop
     Loop --> Desktop["DesktopState\nkernel/src/gfx/desktop.rs"]
     Desktop --> FB["Double-Buffered Framebuffer & Themes\nkernel/src/gfx/{fb,color}.rs"]
-    Desktop --> Apps["GUI Apps & Widgets\napps.rs (Paint / Notepad / Files) & ui.rs"]
+    Desktop --> Apps["GUI Apps & Widgets\napps.rs (Paint / Notepad / Files / IoT) & ui.rs"]
     Desktop --> Shell["TerminalState\nkernel/src/shell.rs"]
     Desktop --> Net
+    Desktop --> IoT
     Shell --> FS
     Shell --> Mem
     Shell --> Drivers
     Shell --> Net
+    Shell --> IoT
     Shell --> User
     Shell --> Task
     Shell --> Arch
     Apps --> FS
+    Apps --> Net
+    Apps --> IoT
 ```
 
 ### 仓库目录与模块职责对照表
@@ -73,25 +80,27 @@ flowchart TD
 | [docs/DESIGN.md](DESIGN.md) | 系统架构与核心子系统设计文档（本文档） |
 | [docs/CHANGELOG.md](CHANGELOG.md) | 版本里程碑与变更追踪日志 |
 | [scripts/build-images.sh](../scripts/build-images.sh) | 编译链接 `user/hello.S` 为 `dist/hello.elf` 并构建 `wmos.iso`、`wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt` |
-| [scripts/verify-qemu.sh](../scripts/verify-qemu.sh) | 无头 QEMU BIOS/UEFI（含 SATA 磁盘持久化、冷重启、e1000 `ping` 与 Ring-3 `exec`）断言、命令注入与 `boot-preview.png` 导出 |
+| [scripts/verify-qemu.sh](../scripts/verify-qemu.sh) | 无头 QEMU BIOS/UEFI（含 SATA 持久化、冷重启、e1000/DHCP/HTTP/MQTT/UDP/COM2 MCU 与 Ring-3 `exec`）断言与 `boot-preview.png` 导出 |
 | [user/hello.S](../user/hello.S) | 独立 Ring-3 x86_64 AT&T 汇编用户程序（链接至 `0x400000` 并打包为 `/bin/hello.elf`） |
 | [kernel/Cargo.toml](../kernel/Cargo.toml) | `wmos-kernel` crate 元数据与 `limine = "0.5"` 依赖 |
 | [kernel/.cargo/config.toml](../kernel/.cargo/config.toml) | 裸机目标与 `relocation-model=static`、`code-model=kernel` 编译参数 |
 | [kernel/build.rs](../kernel/build.rs) | 传入 `-T kernel/linker-x86_64.ld` 链接参数并监听脚本变更 |
 | [kernel/linker-x86_64.ld](../kernel/linker-x86_64.ld) | 高半核 ELF64 链接脚本（基址 `0xffffffff80000000`） |
-| [kernel/src/main.rs](../kernel/src/main.rs) | `kmain` 初始化序列、`syscall::init()`、`net::poll()`、`task::yield_now()` + `sti_and_hlt()` 主循环与 `panic_handler` |
+| [kernel/src/main.rs](../kernel/src/main.rs) | `kmain` 初始化序列（含 `com2_init` / `iot::init`）、`net::poll()`、`task::yield_now()` + `sti_and_hlt()` 主循环与 `panic_handler` |
 | [kernel/src/boot_info.rs](../kernel/src/boot_info.rs) | `BootSummary` 与 `FramebufferInfo` 引导信息契约 |
-| [kernel/src/shell.rs](../kernel/src/shell.rs) | `TerminalState`、64 条命令历史、Tab 补全、`ShellAction` 与 26 条内置命令（含 `ifconfig`/`ping`/`udp`/`exec`） |
+| [kernel/src/shell.rs](../kernel/src/shell.rs) | `TerminalState`、64 条命令历史、Tab 补全、`ShellAction` 与 32 条内置命令（含 `dhcp`/`ipset`/`http`/`mqtt`/`mcu`/`iot`/`exec`） |
 | [kernel/src/task/mod.rs](../kernel/src/task/mod.rs) | 3 任务协作式调度器、`global_asm!` 上下文切换与 `TaskInfo` |
 | [kernel/src/user/mod.rs](../kernel/src/user/mod.rs) | 用户态子系统导出：`elf` |
 | [kernel/src/user/elf.rs](../kernel/src/user/elf.rs) | ELF64 `ET_EXEC` 加载器、`UserAddressSpace` 隔离、16 KiB 用户栈与 `ExecOutput` / `run_elf` |
-| [kernel/src/net/mod.rs](../kernel/src/net/mod.rs) | `NetConfig`（`10.0.2.15/24`）、IPv4/ARP/ICMP/UDP 协议栈与 `ping` / `send_udp` |
+| [kernel/src/net/mod.rs](../kernel/src/net/mod.rs) | `NetConfig`、IPv4/ARP/DHCPv4/ICMP/UDP 协议栈与 `dhcp_acquire` / `udp_exchange` / `ping` |
+| [kernel/src/net/tcp.rs](../kernel/src/net/tcp.rs) | 同步 `TcpStream` 状态机、RFC 1071 TCP 伪首部校验和、`http_get` 与 MQTT 3.1.1 `mqtt_publish` |
+| [kernel/src/iot/mod.rs](../kernel/src/iot/mod.rs) | IoT 设备注册表与统一控制总线（`DeviceKind`、`SmartDevice`、`toggle`、`mcu_send`、`set_endpoint`） |
 | [kernel/src/fs/mod.rs](../kernel/src/fs/mod.rs) | 统一文件系统层：可读写 RAMFS 与根目录 `/disk/<8.3>` FAT32 持久化挂载（子目录写保护） |
 | [kernel/src/fs/fat32.rs](../kernel/src/fs/fat32.rs) | GPT (`EFI PART`, `ef00`) 与 FAT32 BPB/簇链/LFN+8.3 读写及根目录文件增删驱动 |
 | [kernel/src/arch/mod.rs](../kernel/src/arch/mod.rs) | 架构层导出：`cpu`、`gdt`、`idt`、`io`、`pic`、`pit`、`rtc`、`serial`、`syscall` |
 | [kernel/src/arch/io.rs](../kernel/src/arch/io.rs) | 端口 I/O：`inb`、`outb`、`inw`、`outw`、`inl`、`outl` 与 `io_wait` |
 | [kernel/src/arch/cpu.rs](../kernel/src/arch/cpu.rs) | `cli`、`sti`、`hlt`、`sti_and_hlt`、`halt_loop`、`rdtsc`、`read_cr3`、`invlpg`、`reboot`、`shutdown` |
-| [kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs) | COM1 (`0x3F8`) 115200 8N1 串口驱动与 `serial_print!` / `serial_println!` |
+| [kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs) | COM1 (`0x3F8`) 内核串口日志与 COM2 (`0x2F8`) 115200 8N1 外部 MCU 行通信驱动 |
 | [kernel/src/arch/gdt.rs](../kernel/src/arch/gdt.rs) | 7 项 64 位 GDT（含 `USER_DS`/`USER_CS`）、`Tss`、`TSS_RSP0_STACK` 与 `DOUBLE_FAULT_STACK`（IST1） |
 | [kernel/src/arch/pic.rs](../kernel/src/arch/pic.rs) | 双 8259 PIC 重映射（`0x20`/`0x28`）、IRQ 掩码配置与 `send_eoi` |
 | [kernel/src/arch/pit.rs](../kernel/src/arch/pit.rs) | 8254 PIT 通道 0（100 Hz）全局滴答计数 |
@@ -114,8 +123,8 @@ flowchart TD
 | [kernel/src/gfx/fb.rs](../kernel/src/gfx/fb.rs) | 双缓冲 RAM 帧缓存、`present_rect`/`present_all` MMIO 刷新与 Bresenham `draw_line` |
 | [kernel/src/gfx/font.rs](../kernel/src/gfx/font.rs) | 95 字符 `0x20..=0x7E` 的 `8x8` 点阵字库 |
 | [kernel/src/gfx/ui.rs](../kernel/src/gfx/ui.rs) | `StackBuf<N>`、`Window`、`WindowButton`、`draw_progress_bar` 与 `CursorLayer` |
-| [kernel/src/gfx/apps.rs](../kernel/src/gfx/apps.rs) | `PaintApp` 画板、`NotepadApp` 编辑器（支持 `/disk/<8.3>` 保存与子目录只读保护）与 `FilesApp` 文件管理器 |
-| [kernel/src/gfx/desktop.rs](../kernel/src/gfx/desktop.rs) | `DesktopState` 5 窗口管理、Start 菜单、主题切换、动态任务栏与实时监控 |
+| [kernel/src/gfx/apps.rs](../kernel/src/gfx/apps.rs) | `PaintApp` 画板、`NotepadApp` 编辑器、`FilesApp` 文件管理器与 `IotApp` 智能家居控制台 |
+| [kernel/src/gfx/desktop.rs](../kernel/src/gfx/desktop.rs) | `DesktopState` 6 窗口管理、9 项 Start 菜单、主题切换、动态任务栏与实时监控 |
 
 ---
 
@@ -159,12 +168,14 @@ sequenceDiagram
     participant Bus as "PCI / AHCI / e1000"
     participant FS as "RAMFS & FAT32"
     participant Task as "Task Scheduler"
-    participant Net as "Net (ARP/ICMP/UDP)"
+    participant Net as "Net (DHCP/TCP/HTTP/MQTT)"
+    participant IoT as "IoT Hub (iot/mod.rs)"
     participant UI as "DesktopState"
 
     Limine->>KMain: "Enter kmain() with HHDM, MemMap, FB"
     KMain->>KMain: "cli() + serial::init() -> [wmos] boot ok"
     KMain->>Arch: "gdt::init() + pic::init() + idt::init() + syscall::init()"
+    KMain->>Arch: "com2_init() -> [wmos] com2 mcu uart ok"
     KMain->>Mem: "pmm::init() -> vmm::self_test() -> heap::init() + self_test()"
     KMain->>Arch: "rtc::read() -> [wmos] rtc ok"
     KMain->>FS: "fs::init() + self_test() -> [wmos] fs ok"
@@ -174,6 +185,7 @@ sequenceDiagram
     KMain->>Task: "task::init() (2 initial yields) -> [wmos] sched ok"
     KMain->>Bus: "e1000::init() -> [wmos] e1000 ok|skipped"
     KMain->>Net: "net::init() -> [wmos] net ok ip=10.0.2.15"
+    KMain->>IoT: "iot::init() -> [wmos] iot hub ok devices=4"
     KMain->>Arch: "pit::init() + mouse::set_bounds + ps2::init() -> [wmos] pit+ps2 ok"
     KMain->>UI: "DesktopState::new() -> [wmos] fb double-buffer ok + desktop rendered"
     KMain->>KMain: "sti() -> [wmos] ready"
@@ -195,6 +207,7 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 | `[wmos] gdt+tss ok` | `main.rs` | 64 位 GDT、TSS 与 IST1 双重错误栈加载完成（BIOS/UEFI 必检） |
 | `[wmos] idt+pic ok` | `main.rs` | 双 8259 PIC 重映射与 256 项 IDT 加载完成（BIOS/UEFI 必检） |
 | `[wmos] syscall+ring3 ok` | `main.rs` | 7 项 GDT（含 Ring-3 段）及 `SYSCALL`/`SYSRET` MSR 配置完成（BIOS/UEFI 必检） |
+| `[wmos] com2 mcu uart ok` | `main.rs` | COM2 (`0x2F8`, 115200 8N1) 外部 MCU 串口通道初始化完成（BIOS/UEFI 必检） |
 | `[wmos] pmm ok free=<n> total=<n> frames` | `main.rs` | PMM 位图初始化完成（BIOS/UEFI 必检前缀 `[wmos] pmm ok`） |
 | `[wmos] vmm self-test ok` | `main.rs` | VMM 4 级页表自检通过（BIOS/UEFI 必检） |
 | `[wmos] heap ok size=<kib> KiB` | `main.rs` | 内核堆映射与自由链表初始化完成（BIOS/UEFI 必检前缀 `[wmos] heap ok`） |
@@ -206,7 +219,8 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 | `[wmos] disk fat32 ok files=<n>` / `[wmos] disk fat32 skipped` | `main.rs` | 挂盘时索引 `/disk/` 文件数（UEFI 必检 `[wmos] disk fat32 ok`）；无盘时打印 `skipped` |
 | `[wmos] sched ok tasks=<n>` | `main.rs` | 3 任务协作调度器初始化且至少完成 2 次上下文切换（BIOS/UEFI 必检前缀 `[wmos] sched ok`） |
 | `[wmos] e1000 ok mac=<mac>` / `[wmos] e1000 skipped` | `main.rs` | 检测到 Intel e1000/e1000e 并完成 MMIO 与收发环初始化（UEFI Boot #1 必检前缀 `[wmos] e1000 ok mac=`） |
-| `[wmos] net ok ip=<ip> gw=<gw>` | `main.rs` | IPv4/ARP/ICMP/UDP 协议栈启动（UEFI Boot #1 必检前缀 `[wmos] net ok ip=10.0.2.15`） |
+| `[wmos] net ok ip=<ip> gw=<gw>` | `main.rs` | IPv4/ARP/ICMP/UDP/TCP 协议栈启动（UEFI Boot #1 必检前缀 `[wmos] net ok ip=10.0.2.15`） |
+| `[wmos] iot hub ok devices=<n>` | `main.rs` | IoT 智能家居设备中心初始化完成（预置 4 台设备，BIOS/UEFI 必检前缀 `[wmos] iot hub ok`） |
 | `[wmos] pit+ps2 ok` | `main.rs` | 100 Hz PIT 与 8042 PS/2 初始化完成（BIOS/UEFI 必检） |
 | `[wmos] limine rev=<r> hhdm=<hex>` | `main.rs` | 打印 Limine 协议版本号与 HHDM 基址 |
 | `[wmos] memmap entries=<n> usable=<m> MiB total=<m> MiB` | `main.rs` | 打印物理内存表项数及可用/总内存 MiB |
@@ -215,10 +229,15 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 | `[wmos] desktop rendered` | `main.rs` | 初始桌面、窗口、任务栏与光标渲染完成（BIOS/UEFI 必检） |
 | `[wmos] ready` | `main.rs` | 已执行 `sti()` 开启中断并进入主循环（BIOS/UEFI 必检） |
 | `[wmos] mouse active (<x>, <y>)` | `desktop.rs` | 首次收到鼠标有效数据包（UEFI 交互必检前缀 `[wmos] mouse active`） |
-| `[wmos] cmd: <cmd>` | `shell.rs` | 终端执行命令（UEFI Boot #1 必检 `lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`write /disk/persist.txt hello-v4`、`ifconfig`、`ping 10.0.2.2`、`exec /disk/bin/hello.elf`、`open files`；Boot #2 冷重启必检 `cat /disk/persist.txt`） |
+| `[wmos] cmd: <cmd>` | `shell.rs` | 终端执行命令（UEFI Boot #1 必检 `lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`write /disk/persist.txt hello-v4`、`ifconfig`、`dhcp`、`ping 10.0.2.2`、`exec /disk/bin/hello.elf`、`open iot`；Boot #2 冷重启必检 `cat /disk/persist.txt`） |
 | `[wmos] fs cat <name> ok` | `shell.rs` | `cat` 成功读取 RAMFS 或 FAT32 磁盘文件（UEFI Boot #1 必检 `disk/boot/limine/limine.conf` 与 `demo.txt`；Boot #2 冷重启必检 `disk/persist.txt`） |
 | `[wmos] fs disk write <norm> ok (<B> B)` | `fs/mod.rs` | `write`/`append`/`touch` 成功写入根目录 `/disk/<8.3>` FAT32 文件并刷盘（UEFI Boot #1 必检前缀 `[wmos] fs disk write disk/persist.txt ok`） |
 | `[wmos] fs disk rm <norm> ok` | `fs/mod.rs` | `rm` 或 `FilesApp` 成功删除根目录 `/disk/<8.3>` FAT32 文件并释放簇链 |
+| `[wmos] dhcp ok ip=<ip> gw=<gw>` | `shell.rs` | `dhcp` 成功完成 `DHCPDISCOVER`/`DHCPOFFER`/`DHCPREQUEST`/`DHCPACK` 租约获取（UEFI Boot #1 必检前缀 `[wmos] dhcp ok ip=10.0.2.15`） |
+| `[wmos] http ok <ip>:<port><path>` | `shell.rs` | `http` 成功经 TCP/IPv4 发送 `HTTP/1.0 GET` 并收到响应（UEFI Boot #1 必检 `[wmos] http ok 10.0.2.2:18080/iot/lamp/on`） |
+| `[wmos] mqtt ok <topic>=<msg>` | `shell.rs` | `mqtt` 成功完成 MQTT 3.1.1 `CONNECT`/`CONNACK`/QoS-0 `PUBLISH`/`DISCONNECT`（UEFI Boot #1 必检 `[wmos] mqtt ok home/lamp=on`） |
+| `[wmos] iot toggle <id> ok state=<on\|off>` | `iot/mod.rs` | IoT 设备成功通过对应传输通道切换状态（UEFI Boot #1 必检前缀 `[wmos] iot toggle plug ok`） |
+| `[wmos] mcu ok <reply>` | `iot/mod.rs` | COM2 UART MCU 成功返回一行应答（UEFI Boot #1 必检前缀 `[wmos] mcu ok TEMP=24C`） |
 | `[wmos] ping <ip> ok rtt=<ms>ms` | `shell.rs` | `ping` 收到首个匹配 ICMP Echo Reply 并输出往返时间（UEFI Boot #1 必检前缀 `[wmos] ping 10.0.2.2 ok`） |
 | `[wmos] udp sent <ip>:<port>` | `shell.rs` | `udp` 命令成功通过 `net::send_udp` 发送 UDP/IPv4 数据报 |
 | `[wmos] user: <line>` | `syscall.rs` | Ring-3 用户程序通过 `SYS_WRITE` 输出的一行标准输出（UEFI Boot #1 必检 `Hello from WMOS Ring-3 ELF64 userland!` 与 `Syscall ABI verified (CPL=3 -> Ring 0 -> CPL=3).`） |
@@ -235,6 +254,7 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 
 ### 5.1 架构层、7 项 GDT 与快速系统调用（`kernel/src/arch/`）
 
+- **COM1/COM2 双串口驱动（[serial.rs](../kernel/src/arch/serial.rs)）**：COM1 (`0x3F8`) 专用于内核启动/诊断串口输出；`com2_init()` 将 COM2 (`0x2F8`) 配置为 `115200 8N1` 与 14 字节 FIFO 并执行环回自检，提供 `com2_write_bytes(data)` 与 `com2_exchange_line(cmd, timeout_ticks)`（排空残留 RX `LSR_RX_READY (0x01)` 后写入换行命令并在 PIT 超时内协作等待最多 128 字节 MCU 响应行）。
 - **16/32 位端口 I/O 与关机（[io.rs](../kernel/src/arch/io.rs), [cpu.rs](../kernel/src/arch/cpu.rs)）**：`inw`/`outw`/`inl`/`outl` 供 PCI 与 ACPI 端口访问；`cpu::shutdown()` 关中断后依次向 QEMU/Bochs/VirtualBox ACPI 关机端口写入 `outw(0x604, 0x2000)`、`outw(0xB004, 0x2000)`、`outw(0x4004, 0x3400)`，未立即断电则进入 `halt_loop()`。`sti_and_hlt()` 原子开中断休眠。
 - **7 项 GDT/TSS 与用户态异常隔离（[gdt.rs](../kernel/src/arch/gdt.rs), [idt.rs](../kernel/src/arch/idt.rs)）**：
   - `GDT` 扩展至 7 项以契合 x86_64 `STAR`/`SYSRETQ` 选择子顺序：`0x00` Null、`0x08` `KERNEL_CS`、`0x10` `KERNEL_DS`、`0x18` User Data（`USER_DS = 0x1B`）、`0x20` User Code（`USER_CS = 0x23`）、`0x28`/`0x30` 16 字节 TSS；`tss.rsp[0]` 指向 16 KiB `TSS_RSP0_STACK` 栈顶，`tss.ist[0]` 指向 16 KiB `DOUBLE_FAULT_STACK` 栈顶。
@@ -303,14 +323,16 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
   - `global_asm!` 中的 `switch_context(old_rsp: *mut u64, new_rsp: u64)` 按 System V AMD64 ABI 保存/恢复被调用者保存寄存器（`rbp`, `rbx`, `r12`, `r13`, `r14`, `r15`），更新 `old_rsp` 并切至 `new_rsp` 后 `ret` 恢复执行流。
   - `init()` 预先执行 `2` 次 `yield_now()` 完成 3 任务首次轮转；主事件循环每轮调用 `task::yield_now()` 并通过 `TOTAL_SWITCHES` 与每任务 `switches`/`ticks` 统计供 `ps` 与 `System Info` 查询。
 
-### 5.6 IPv4/ARP/ICMP/UDP 网络协议栈（[kernel/src/net/mod.rs](../kernel/src/net/mod.rs)）
+### 5.6 网络协议栈：ARP / DHCP / ICMP / UDP / TCP / HTTP / MQTT（[kernel/src/net/mod.rs](../kernel/src/net/mod.rs) & [tcp.rs](../kernel/src/net/tcp.rs)）
 
-- **静态配置与链路状态**：`NetConfig` 默认配置为 QEMU SLIRP 用户态网络参数：`ip = [10, 0, 2, 15]`、`netmask = [255, 255, 255, 0]`、`gateway = [10, 0, 2, 2]`；`init()` 在检测到 `e1000::info()` 后启用 `NET` 状态并主动发送网关 ARP 请求。
-- **核心协议实现**：
-  - 支持 `ETH_TYPE_ARP (0x0806)` 与 `ETH_TYPE_IPV4 (0x0800)` 以太网帧封装（最小帧长 `MIN_ETH_LEN = 60`）、`rfc1071_checksum` 首部/ICMP 校验和与 `parse_ipv4` 点分十进制解析。
-  - `ARP_CACHE_SIZE = 16` 环形 ARP 缓存表（`arp_learn` / `arp_lookup`），`resolve_mac` 判定同网段直连或走 `gateway`，每 `33` PIT ticks 重试 ARP 请求，超时上限 `100` ticks。
-  - `poll()` 每轮从 `e1000::poll_recv` 排空最多 `16` 帧，自动学习对端 ARP 映射并自动回复目标为本机 `LOCAL_IP` 的 ARP Request 与 ICMP Echo Request。
-  - `ping(target_ip, seq)` 构造 `ICMP_ECHO_ID = 0x574D` Echo Request 并轮询匹配回复（超时 `150` ticks），按 PIT `HZ` 换算并返回 `rtt_ms`；`send_udp(dst_ip, src_port, dst_port, payload)` 支持最大 `1472 B` 载荷的 UDP/IPv4 发送。
+- **IPv4 基础、DHCPv4 与 UDP 交换（[net/mod.rs](../kernel/src/net/mod.rs)）**：
+  - 默认 `NetConfig` 为 `10.0.2.15/24`、网关 `10.0.2.2`；`set_config(ip, netmask, gateway)` 动态更新配置并清空 `ARP_CACHE_SIZE = 16` 缓存；`poll()` 每轮排空最多 `16` 个以太网帧并自动响应入站 ARP/ICMP Echo。
+  - `dhcp_acquire()` 经 UDP `68 -> 67` 广播（`0.0.0.0 -> 255.255.255.255`，`DHCP_XID = 0x574D_5635`，BOOTP Cookie `[99, 130, 83, 99]`）发送 `DHCPDISCOVER`（Option 53=`1`、Option 55=`[1, 3, 6]`），在 `200` PIT ticks 内接收 `DHCPOFFER`（解析 `yiaddr` 及 Option `1`/`3`/`54`），再发送 `DHCPREQUEST` 并等待 `DHCPACK`（Option 53=`5`）后自动应用 `set_config`；支持通配接收发往端口 `68` 的 UDP 广播/单播响应。
+  - `ping(target_ip, seq)` 构造 `ICMP_ECHO_ID = 0x574D` 请求并返回 RTT（毫秒）；`send_udp` 与 `udp_exchange(dst_ip, dst_port, payload, timeout_ticks)` 支持单向发送以及基于 `40000..=49999` 临时端口的请求-应答交换。
+- **同步 TCP 状态机、HTTP/1.0 与 MQTT 3.1.1（[net/tcp.rs](../kernel/src/net/tcp.rs)）**：
+  - `TcpStream` 基于 `pseudo_header_checksum` 与 `send_ipv4_packet` 实现 `connect()`（`SYN` -> `SYN|ACK` -> `ACK`）、`send_all()`（`PSH|ACK` 分片与 `ACK` 确认）、`recv_until_close()` / `recv_some()` 与 `close()`（`FIN|ACK`），在等待报文期间转发非 TCP 帧至 `handle_non_tcp_frame` 以保持 ARP/ICMP 响应。
+  - `http_get(dst_ip, port, path)` 发送 `HTTP/1.0 GET`（`Connection: close`）并读取最多 `MAX_HTTP_BYTES = 4096` 字节响应文本。
+  - `mqtt_publish(broker_ip, port, topic, payload)` 构造 MQTT 3.1.1 `CONNECT`（`0x10`、协议级别 `4`、Clean Session `0x02`、保活 `60`、`clientId = "wmos-v5"`），校验 `CONNACK`（`0x20` 返回码 `0x00`），随后发送 QoS-0 `PUBLISH`（`0x30` + varint 剩余长度）及 `DISCONNECT`（`0xE0 0x00`）。
 
 ### 5.7 Ring-3 ELF64 加载器与用户态示例（[kernel/src/user/elf.rs](../kernel/src/user/elf.rs) & [user/hello.S](../user/hello.S)）
 
@@ -320,16 +342,23 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
   - 同步调用 `syscall::enter_user_mode`，执行结束后释放 `user_space`、打印 `[wmos] user elf exit=<code>` 并返回 `ExecOutput { exit_code, stdout }`。
 - **用户态汇编示例（[user/hello.S](../user/hello.S)）**：使用 freestanding x86_64 AT&T 汇编依次发起 `SYS_WRITE (1)`、`SYS_GETPID (20)`、`SYS_UPTIME (96)`、`SYS_WRITE (1)` 与 `SYS_EXIT (60)`，经 `gcc -nostdlib -static -no-pie -Wl,-Ttext=0x400000 -Wl,--build-id=none` 链接为 `dist/hello.elf` 并预装至光盘与 FAT32 磁盘 `/bin/hello.elf`。
 
-### 5.8 主题系统、多窗口桌面、Apps 与升级版 Shell（`kernel/src/gfx/` & `kernel/src/shell.rs`）
+### 5.8 IoT 智能家居设备中心（[kernel/src/iot/mod.rs](../kernel/src/iot/mod.rs)）
+
+- **异构设备抽象**：`DeviceKind::{WifiHttp, WifiMqtt, WifiUdp, UartMcu}` 与 `SmartDevice` 维护设备 `id`、`name`、传输端点（`ip`/`port`/`target`）、开关状态 `on` 及最近一次回执 `last_reply`。
+- **预置设备与控制总线**：`init()` 注册 `4` 台默认设备：`lamp`（`Desk Lamp (HTTP)` -> `10.0.2.2:18080` `/iot/lamp`）、`ac`（`Living AC (MQTT)` -> `10.0.2.2:11883` `home/ac/power`）、`plug`（`Smart Plug (UDP)` -> `10.0.2.2:18888` `TOGGLE`）与 `mcu`（`ESP32 MCU (COM2)` -> `0x2F8` `LED`）。
+- **核心操作**：`list()` 返回快照、`set_endpoint(id, ip, port)` 动态改绑端点、`toggle(id)` 经实际协议执行开/关切换并打印 `[wmos] iot toggle <id> ok state=<on|off>`、`mcu_send(cmd)` 经 `serial::com2_exchange_line(cmd, 80)` 发送串口指令并打印 `[wmos] mcu ok <reply>`。
+
+### 5.9 主题系统、6 窗口桌面、Apps 与升级版 Shell（`kernel/src/gfx/` & `kernel/src/shell.rs`）
 
 - **主题切换（[color.rs](../kernel/src/gfx/color.rs)）**：定义 `Theme::{Dark, Ocean, Amber}` 与 `ThemePalette`（控制壁纸上下渐变、任务栏 Accent 按钮与活跃窗口标题栏/高亮边框）。
-- **5 窗口桌面与 Start 菜单（[desktop.rs](../kernel/src/gfx/desktop.rs), [apps.rs](../kernel/src/gfx/apps.rs), [ui.rs](../kernel/src/gfx/ui.rs)）**：
-  - 5 个窗口：`0: System Info`、`1: WMOS Terminal`、`2: WMOS Paint`、`3: WMOS Notepad`、`4: WMOS Files`；任务栏动态水平排布所有非 `Closed` 标签（`Info`、`Term`、`Paint`、`Note`、`Files`）以免与右侧托盘重叠。
-  - `WMOS` Start 菜单共 8 项：5 个应用入口、`Theme: <name>`（点击实时循环切换主题）、`Reboot System`、`Shutdown`。
-  - `WMOS Files`（`FilesApp`）同时列出 `[RAM ]` 与 `[DISK]` 文件，底部状态提示区分 `FAT32 RW`（根目录 `/disk/<8.3>` 可读写/可删除）、`Protected`（`/disk/boot/` 等子目录受写保护不可写删）与 `RAMFS`；`Open` 打开至 `WMOS Notepad`（由 `is_disk_readonly_path` 判断，仅子目录或 `/disk` 自身设为 `ReadOnly`，根目录 `/disk/<8.3>` 支持 `Save`/`Clear` 落盘并在写失败时显示 `Error`）、`New` 新建 `note_<id>.txt`、`Del` 支持删除 RAMFS 与根目录 `/disk/<8.3>` 磁盘文件、`Refresh` 刷新列表。
-  - `System Info` 与桌面顶栏实时展示 `WMOS v4.2.0 // x86_64 FAT32 RW + e1000 Net + Ring-3 ELF64`、`wmos v4.2.0`、CMOS RTC、双缓冲状态、PMM/Heap 进度条、RAMFS + FAT32 文件数、PCI 设备与调度器切换数、实时 `Net` IPv4 与 TX/RX 包统计、`Ring-3  : Syscall + ELF64 READY`、KBD/MSE IRQ、鼠标坐标及当前主题。
-- **26 命令终端（[shell.rs](../kernel/src/shell.rs)）**：
-  - 在 `v4.1.0` 25 条命令基础上新增 `exec <path>`（经 `fs::read` 读取静态 ELF64 并调用 `user::elf::run_elf` 同步展示 `stdout` 与退出码），同步更新 `COMMANDS` Tab 补全列表、`help`、`info` 与 `about` 至 `wmos v4.2.0`。
+- **6 窗口桌面与 9 项 Start 菜单（[desktop.rs](../kernel/src/gfx/desktop.rs), [apps.rs](../kernel/src/gfx/apps.rs), [ui.rs](../kernel/src/gfx/ui.rs)）**：
+  - 6 个窗口：`0: System Info`、`1: WMOS Terminal`、`2: WMOS Paint`、`3: WMOS Notepad`、`4: WMOS Files`、`5: WMOS IoT Hub`；任务栏动态水平排布所有非 `Closed` 标签（`Info`、`Term`、`Paint`、`Note`、`Files`、`IoT`）以免与右侧托盘重叠。
+  - `WMOS` Start 菜单扩展至 `9` 项：6 个应用入口、`Theme: <name>`（点击实时循环切换主题）、`Reboot System`、`Shutdown`。
+  - `WMOS IoT Hub`（`IotApp`）顶部工具栏展示动态 `net::config()` IP 与可点击 `[DHCP]`/`[Refresh]` 按钮；设备列表显示 `[ON ]`/`[OFF]` 状态徽章、协议端点、最近回复以及行内 `[Toggle]`（MCU 行额外提供 `[Temp]` 按钮发送 `"temp"`）。
+  - `WMOS Files`（`FilesApp`）同时列出 `[RAM ]` 与 `[DISK]` 文件，区分 `FAT32 RW`、`Protected` 与 `RAMFS`；`WMOS Notepad` 支持根目录 `/disk/<8.3>` 保存并保留子目录写保护。
+  - `System Info` 与桌面顶栏实时展示 `WMOS v5.0.0 // x86_64 FAT32 + e1000 TCP/HTTP/MQTT + IoT Hub`、`wmos v5.0.0`、动态 `Net` IPv4 与 TX/RX 包统计、`Ring-3  : Syscall + ELF64 READY` 与 `IoT     : 4 devices (HTTP/MQTT/UDP/UART)`。
+- **32 命令终端（[shell.rs](../kernel/src/shell.rs)）**：
+  - 在 `v4.2.0` 26 条命令基础上新增 `dhcp`、`ipset <ip> <gw>`、`http <ip> <port> <path>`、`mqtt <ip> <port> <topic> <msg>`、`mcu <cmd>`、`iot list|toggle <id>|set <id> <ip> <port>` 及 `open iot`（返回 `ShellAction::OpenApp(5)`），同步更新 `COMMANDS` Tab 补全、`help`、`info` 与 `about` 至 `wmos v5.0.0`。
 
 ---
 
@@ -339,26 +368,26 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
   - 触发器涵盖 `push`（`branches: ["**"]` 与 `tags: ["v*"]`）、`pull_request` 及 `workflow_dispatch`，作业 `build-and-verify` 运行于 `ubuntu-latest` 并声明 `permissions: contents: write`。
   - 在构建内核、打包镜像并完整通过 `./scripts/verify-qemu.sh` 验证后，分别上传 `wmos-images` 与 `wmos-ci-logs-and-preview` 两个 Actions 产物；当触发源为 `v*` 标签（`startsWith(github.ref, 'refs/tags/v')`）时，自动执行 `Publish GitHub Release`（`softprops/action-gh-release@v2`，启用 `generate_release_notes: true` 与 `fail_on_unmatched_files: true`），向 `WMOS ${{ github.ref_name }}` 发布 `dist/wmos.iso`、`dist/wmos.img`、`dist/wmos.qcow2`、`dist/wmos.vmdk`、`dist/wmos.vhd`、`dist/SHA256SUMS.txt` 与 `dist/boot-preview.png` 共 7 项 Release 资产。
 - **镜像打包（[scripts/build-images.sh](../scripts/build-images.sh)）**：先将 `user/hello.S` 静态汇编链接为 `dist/hello.elf` 并拷贝至 `iso_root/bin/hello.elf` 与 `::/bin/hello.elf`，随后生成 Hybrid BIOS+UEFI `dist/wmos.iso`、64 MiB GPT（`ef02` 分区 1 `2048:4095` + `ef00` FAT32 分区 2 `4096:+60M`）`dist/wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt`。
-- **QEMU 双模式、外部磁盘镜像、冷重启、网络与 Ring-3 校验（[scripts/verify-qemu.sh](../scripts/verify-qemu.sh)）**：
-  - **`[1/3]` Legacy BIOS**：`dist/wmos.iso` 校验全部 18 项启动/初始化标记（含 `[wmos] syscall+ring3 ok`）且无 `PANIC`/`EXCEPTION`。
-  - **`[2/3]` UEFI (OVMF) Boot #1 + AHCI 写入 + e1000 网络 + Ring-3 ELF64 + `mtype` 校验**：复制 `dist/wmos.img` 为 `dist/wmos-persist-test.img` 并与 `-cdrom dist/wmos.iso` 及 `-netdev user,id=net0 -device e1000,netdev=net0` 一同挂载，通过 `/tmp/wmos-mon.sock` 发送 `mouse_move 40 25` 与 11 条交互操作（`lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`cat demo.txt`、`write /disk/persist.txt hello-v4`、`ifconfig`、`ping 10.0.2.2`、`exec /disk/bin/hello.elf`、`open files`），断言 `[wmos] ahci ok disks=1`、`[wmos] disk fat32 ok`、`[wmos] e1000 ok mac=`、`[wmos] net ok ip=10.0.2.15`、`[wmos] mouse active`、`[wmos] fs disk write disk/persist.txt ok`、`[wmos] cmd: ifconfig`、`[wmos] cmd: ping 10.0.2.2`、`[wmos] ping 10.0.2.2 ok`、`[wmos] cmd: exec /disk/bin/hello.elf`、`[wmos] user: Hello from WMOS Ring-3 ELF64 userland!`、`[wmos] user: Syscall ABI verified (CPL=3 -> Ring 0 -> CPL=3).`、`[wmos] user elf exit=0` 及全部命令标记并导出 `dist/boot-preview.png`；随后在宿主侧运行 `mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT` 校验文件内容确含 `hello-v4`。
-  - **`[3/3]` UEFI (OVMF) Boot #2 冷重启持久化验证**：关停首个 QEMU 实例后再次冷启动 QEMU（日志输出至 `dist/qemu-uefi-reboot.log`），继续挂载同一 `dist/wmos-persist-test.img`，注入 `cat /disk/persist.txt`，断言全部 18 项基础启动标记与 `[wmos] fs cat disk/persist.txt ok` 均存在且无 `PANIC`/`EXCEPTION`，并在退出前清理临时镜像 `dist/wmos-persist-test.img`。
+- **QEMU 双模式、IoT Mock Hub、COM2 Virtual MCU、冷重启与 Ring-3 校验（[scripts/verify-qemu.sh](../scripts/verify-qemu.sh)）**：
+  - **`[1/3]` Legacy BIOS**：`dist/wmos.iso` 校验全部 20 项启动/初始化标记（含 `[wmos] syscall+ring3 ok`、`[wmos] com2 mcu uart ok`、`[wmos] iot hub ok`）且无 `PANIC`/`EXCEPTION`。
+  - **`[2/3]` UEFI (OVMF) Boot #1 + Mock IoT Hub + COM2 MCU + FAT32 + Ring-3 ELF64**：在启动 QEMU 前拉起后台 Python Mock IoT Hub（TCP `127.0.0.1:18080` HTTP、TCP `127.0.0.1:11883` MQTT 3.1.1、UDP `127.0.0.1:18888` 智能插座及连接 `/tmp/wmos-mcu.sock` 的虚拟 COM2 MCU，日志写入 `dist/iot-mock.log`）；QEMU 挂载 `dist/wmos-persist-test.img`、`-netdev user,id=net0 -device e1000,netdev=net0` 及双串口（`-serial file:dist/qemu-uefi.log -serial unix:/tmp/wmos-mcu.sock,server,nowait`），注入 `lspci`、`ps`、`disks`、`cat /disk/boot/limine/limine.conf`、`write demo.txt hello`、`cat demo.txt`、`write /disk/persist.txt hello-v4`、`ifconfig`、`dhcp`、`http 10.0.2.2 18080 /iot/lamp/on`、`mqtt 10.0.2.2 11883 home/lamp on`、`iot toggle plug`、`mcu temp`、`ping 10.0.2.2`、`exec /disk/bin/hello.elf`、`open iot` 等命令；同时断言 `dist/qemu-uefi.log`（全部 20 项启动标记 + DHCP/HTTP/MQTT/UDP/COM2/FAT32/e1000/Ring-3 交互标记）与 `dist/iot-mock.log`（`HTTP GET /iot/lamp/on`、`MQTT home/lamp=on`、`UDP ON`、`MCU temp`），导出 `dist/boot-preview.png` 并经 `mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT` 校验 `hello-v4`。
+  - **`[3/3]` UEFI (OVMF) Boot #2 冷重启持久化验证**：关停首个 QEMU 实例与 Mock 服务后再次冷启动 QEMU（日志输出至 `dist/qemu-uefi-reboot.log`），继续挂载同一 `dist/wmos-persist-test.img`，注入 `cat /disk/persist.txt`，断言全部 20 项基础启动标记与 `[wmos] fs cat disk/persist.txt ok` 均存在且无 `PANIC`/`EXCEPTION`，并在退出前清理临时镜像 `dist/wmos-persist-test.img`。
 
 ---
 
 ## 7. 已知边界与后续演进路线
 
-### 当前已知边界（`v4.2.0`）
+### 当前已知边界（`v5.0.0`）
 
-- **用户态同步执行与系统调用集**：当前 `exec <path>` 为同步阻塞执行静态 `ET_EXEC` ELF64（暂不支持动态链接、用户态抢占调度或多进程并发后台运行），提供 `SYS_WRITE`、`SYS_GETPID`、`SYS_UPTIME`、`SYS_EXIT` 4 个基础系统调用。
-- **FAT32 写入范围限定**：当前 FAT32 写入与删除限定为根目录 `/disk/<8.3>` 文件（不支持长文件名 LFN 写入与新建子目录）；`/disk/boot/` 与 `/disk/EFI/` 等子目录维持只读保护以保障引导文件安全；RAMFS 仍仅驻留内存不落盘。
-- **静态网络配置与单核协作调度**：当前仅支持 Intel e1000/e1000e 轮询模式与静态 IPv4 (`10.0.2.15/24`) + ARP/ICMP/UDP 发送（尚未支持 DHCP/DNS/TCP）；内核仅运行于 BSP 单核协作式调度且 PMM 位图固定覆盖最高 `4 GiB`。
+- **IoT 传输层协议边界**：TCP 栈为同步单连接停等状态机，HTTP 仅支持明文 `HTTP/1.0 GET`（上限 4 KiB 响应，无 HTTPS/TLS 与 DNS 域名解析），MQTT 仅支持明文 QoS-0 `PUBLISH`（无双向订阅推送）；COM2 串口通信采用 PIT 轮询而非 IRQ3 中断驱动。
+- **用户态同步执行与系统调用集**：`exec <path>` 仍为同步阻塞执行静态 `ET_EXEC` ELF64（提供 `SYS_WRITE`、`SYS_GETPID`、`SYS_UPTIME`、`SYS_EXIT` 4 个系统调用）。
+- **FAT32 写入范围与单核调度**：FAT32 写入/删除限定为根目录 `/disk/<8.3>` 文件（`/disk/boot/` 与 `/disk/EFI/` 保持写保护）；内核仅运行于 BSP 单核协作式调度且 PMM 位图固定覆盖最高 `4 GiB`。
 
 ### 后续演进路线
 
 - **第 1 梯队（抢占调度与多核 SMP）**：接入 Local APIC / IOAPIC 与 ACPI MADT 解析，开启 AP 多核及定时器驱动的抢占式线程/用户进程调度。
-- **第 2 梯队（扩展用户态 POSIX ABI 与进程管理）**：增加 `read` / `open` / `close` / `brk` / `mmap` / `spawn` / `waitpid` 系统调用及用户态 C/Rust SDK。
-- **第 3 梯队（完整 FAT32 目录树与完整 TCP/IP 协议栈）**：为 FAT32 扩展 LFN 长文件名写入与子目录创建/删除能力，并在网络栈补齐 DHCP、DNS 与 TCP 客户端/服务端。
+- **第 2 梯队（扩展用户态 POSIX ABI 与进程管理）**：增加 `read` / `open` / `close` / `socket` / `connect` / `spawn` / `waitpid` 系统调用及用户态网络/IoT 工具集。
+- **第 3 梯队（DNS/TLS、MQTT 订阅与完整 FAT32 目录树）**：补充 UDP DNS 解析、轻量 TLS、非阻塞多连接 TCP/MQTT 订阅推送与 FAT32 LFN 长文件名写入及子目录创建。
 
 ---
 

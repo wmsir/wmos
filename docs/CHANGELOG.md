@@ -1,6 +1,6 @@
 # WMOS 变更日志 (CHANGELOG)
 
-记录 WMOS 从初始引导原型到 `v4.2.0` 及后续演进的全部里程碑与代码级变更。
+记录 WMOS 从初始引导原型到 `v5.0.0` 及后续演进的全部里程碑与代码级变更。
 
 ---
 
@@ -18,7 +18,29 @@
 
 ---
 
-## [Unreleased] - 2026-11-27
+## [v5.0.0] - 2026-11-27
+
+- **变更类型**：`feat` / `ci` / `docs`
+- **改动文件**：
+  - 串口、网络与 IoT 内核子系统：`kernel/src/arch/serial.rs`、`kernel/src/net/mod.rs`、`kernel/src/net/tcp.rs`、`kernel/src/iot/mod.rs`、`kernel/src/main.rs`
+  - 图形界面与终端：`kernel/src/gfx/apps.rs`、`kernel/src/gfx/desktop.rs`、`kernel/src/shell.rs`
+  - IoT 闭环验证与文档：`scripts/verify-qemu.sh`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
+- **变更摘要**：
+  - **COM2 MCU 串口驱动 (`arch/serial.rs`)**：保留 COM1 (`0x3F8`) 内核日志通道，新增 COM2 (`0x2F8`, `115200 8N1`) `com2_init()`、`com2_write_bytes()` 与 `com2_exchange_line(cmd, timeout_ticks)`（先排空残留 RX、写入换行命令并在 PIT 超时内轮询接收最多 128 字节应答行），开机打印 `[wmos] com2 mcu uart ok`。
+  - **DHCPv4 与 UDP 往返交换 (`net/mod.rs`)**：新增 `set_config`（更新 IP/掩码/网关并清空 ARP 缓存）、`dhcp_acquire()`（经 UDP `68 -> 67` 广播以 `DHCP_XID = 0x574D_5635` 完成 `DHCPDISCOVER`/`DHCPOFFER`/`DHCPREQUEST`/`DHCPACK` 租约获取）与 `udp_exchange`（在 `40000..=49999` 临时端口发送并等待回复）。
+  - **TCP 状态机、HTTP/1.0 与 MQTT 3.1.1 (`net/tcp.rs`)**：实现基于伪首部校验和的同步 `TcpStream`（`SYN`/`SYN+ACK`/`ACK`/`PSH+ACK`/`FIN+ACK`/`RST`）、`http_get(dst_ip, port, path)`（上限 `MAX_HTTP_BYTES = 4096`）与 `mqtt_publish(broker_ip, port, topic, payload)`（发送 `CONNECT`、`CONNACK` 校验、QoS-0 `PUBLISH` 与 `DISCONNECT`）。
+  - **IoT 智能家居设备中心 (`iot/mod.rs` & `main.rs`)**：实现 `DeviceKind::{WifiHttp, WifiMqtt, WifiUdp, UartMcu}` 与 `SmartDevice`，预置 4 台设备（`lamp` / `ac` / `plug` / `mcu`）并输出 `[wmos] iot hub ok devices=4`；支持 `toggle(id)`（记录 `[wmos] iot toggle <id> ok state=<on|off>`）、`mcu_send(cmd)`（记录 `[wmos] mcu ok <reply>`）与 `set_endpoint`。
+  - **6 窗口桌面 `WMOS IoT Hub` 与 32 命令终端 (`gfx/{apps,desktop}.rs` & `shell.rs`)**：新增 `IotApp`（`[DHCP]`/`[Refresh]`、设备 `[ON ]`/`[OFF]` 状态、行内 `[Toggle]` 与 MCU `[Temp]` 按钮）；桌面扩展至 6 窗口、6 动态任务栏标签与 9 项 Start 菜单；`System Info` 升级至 `wmos v5.0.0` 并展示动态 IP 与 IoT 设备概览；终端新增 `dhcp`、`ipset`、`http`、`mqtt`、`mcu`、`iot list|toggle|set` 与 `open iot`（输出 `[wmos] dhcp ok`、`[wmos] http ok`、`[wmos] mqtt ok`）。
+  - **CI Mock IoT Hub + Virtual MCU 闭环验证 (`scripts/verify-qemu.sh`)**：UEFI Boot #1 启动后台 Python Mock IoT Hub（HTTP `18080`、MQTT `11883`、UDP `18888`）与 `/tmp/wmos-mcu.sock` COM2 虚拟 MCU，注入全套 IoT/DHCP/HTTP/MQTT/UDP/MCU/FAT32/e1000/Ring-3 命令并校验 `dist/qemu-uefi.log`、`dist/iot-mock.log`、`mtype` 及 Boot #2 冷重启。
+- **验证结果**：
+  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `481864` B，`e_entry=0xffffffff80021f60`）；`scripts/*.sh` 纯 LF 与零禁用标记检查通过。
+  - 待提交推送及打标 `v5.0.0` 后由 GitHub Actions `Build and Verify WMOS` 执行云端全量验证与自动发布 Release。
+
+---
+
+## [v4.2.0-release] - 2026-11-27
+
+### `19e5e91` — 自动化 GitHub Release 发布工作流与 `v4.2.0` 正式发版
 
 - **变更类型**：`ci` / `docs`
 - **改动文件**：
@@ -27,7 +49,7 @@
   - **自动化 GitHub Release 发布（`.github/workflows/build.yml`）**：扩展 `push` 触发器以同时监听全部分支（`branches: ["**"]`）与版本标签（`tags: ["v*"]`）；为 `build-and-verify` 作业赋予 `permissions: contents: write`；在 QEMU 验证与日志上传后新增 `Publish GitHub Release` 步骤（`if: startsWith(github.ref, 'refs/tags/v')`），调用 `softprops/action-gh-release@v2`（`generate_release_notes: true`、`fail_on_unmatched_files: true`）自动发布 `dist/wmos.iso`、`dist/wmos.img`、`dist/wmos.qcow2`、`dist/wmos.vmdk`、`dist/wmos.vhd`、`dist/SHA256SUMS.txt` 与 `dist/boot-preview.png` 共 7 项 Release 资产。
   - **文档同步**：更新 `docs/DESIGN.md` 第 6 节 CI/Release 流程与 `README.md` 从 GitHub Releases 下载及 `git tag` 发版指南，并补全 `[v4.2.0]` 的提交 SHA 与 CI Run 记录。
 - **验证结果**：
-  - `.github/workflows/build.yml` 无 Tab 字符与缩进语法检查通过，所有 Markdown 相对路径链接有效；待提交推送与打标 `v4.2.0` 后由 GitHub Actions 自动验证并发布 Release。
+  - GitHub Actions Tag Run [`46002497939`](https://github.com/wmsir/wmos/actions/runs/46002497939) 全绿通过，正式发布 [`WMOS v4.2.0`](https://github.com/wmsir/wmos/releases/tag/v4.2.0)（7/7 资产：`wmos.iso` `4698112` B、`wmos.img` `67108864` B、`wmos.qcow2` `2031616` B、`wmos.vmdk` `1769472` B、`wmos.vhd` `67125760` B、`SHA256SUMS.txt` `378` B、`boot-preview.png` `22635` B）。
 
 ---
 

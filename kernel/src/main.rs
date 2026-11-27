@@ -8,6 +8,7 @@ mod boot_info;
 mod drivers;
 mod fs;
 mod gfx;
+mod iot;
 mod mem;
 mod net;
 mod shell;
@@ -51,8 +52,10 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 pub extern "C" fn kmain() -> ! {
     arch::cpu::cli();
     arch::serial::init();
-
     serial_println!("[wmos] boot ok");
+
+    arch::serial::com2_init();
+    serial_println!("[wmos] com2 mcu uart ok");
 
     assert!(BASE_REVISION.is_supported(), "Unsupported Limine base revision");
 
@@ -166,6 +169,9 @@ pub extern "C" fn kmain() -> ! {
     } else {
         serial_println!("[wmos] e1000 skipped");
     }
+
+    iot::init();
+    serial_println!("[wmos] iot hub ok devices={}", iot::list().len());
 
     arch::pit::init();
     drivers::mouse::set_bounds(summary.fb.width, summary.fb.height);

@@ -6,13 +6,14 @@ use crate::drivers::keyboard::{self, KeyEvent};
 use crate::drivers::{e1000, mouse, pci};
 use crate::drivers::mouse::MouseState;
 use crate::fs;
-use crate::gfx::apps::{FilesAction, FilesApp, NotepadApp, PaintApp};
+use crate::gfx::apps::{FilesAction, FilesApp, IotApp, NotepadApp, PaintApp};
 use crate::gfx::color::{self, Color, Theme, ThemePalette};
 use crate::gfx::fb::Framebuffer;
 use crate::gfx::ui::{
     draw_progress_bar, BORDER_W, CURSOR_H, CURSOR_W, CursorLayer, StackBuf, TITLE_BAR_H, Window,
     WindowButton,
 };
+use crate::iot;
 use crate::mem::{heap, pmm};
 use crate::net;
 use crate::shell::{ShellAction, TerminalState};
@@ -26,11 +27,11 @@ const START_PILL_X: usize = 8;
 const START_PILL_W: usize = 64;
 const START_MENU_X: usize = 8;
 const START_MENU_W: usize = 184;
-const START_MENU_ITEM_H: usize = 24;
-const START_MENU_COUNT: usize = 8;
+const START_MENU_ITEM_H: usize = 22;
+const START_MENU_COUNT: usize = 9;
 
-const WIN_COUNT: usize = 5;
-const TAB_LABELS: [&str; WIN_COUNT] = ["Info", "Term", "Paint", "Note", "Files"];
+const WIN_COUNT: usize = 6;
+const TAB_LABELS: [&str; WIN_COUNT] = ["Info", "Term", "Paint", "Note", "Files", "IoT"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowVis {
@@ -60,6 +61,7 @@ pub struct DesktopState {
     paint: PaintApp,
     notepad: NotepadApp,
     files: FilesApp,
+    iot: IotApp,
     start_menu_open: bool,
     drag: Option<DragState>,
     prev_buttons: u8,
@@ -100,14 +102,16 @@ impl DesktopState {
                 WindowVis::Closed,
                 WindowVis::Closed,
                 WindowVis::Closed,
+                WindowVis::Closed,
             ],
             default_rects,
-            z_order: [2, 3, 4, 0, 1],
+            z_order: [2, 3, 4, 5, 0, 1],
             cursor: CursorLayer::new(),
             terminal: TerminalState::new(&summary, vmm_ok),
             paint: PaintApp::new(),
             notepad: NotepadApp::new(),
             files: FilesApp::new(),
+            iot: IotApp::new(),
             start_menu_open: false,
             drag: None,
             prev_buttons: 0,
@@ -255,21 +259,21 @@ impl DesktopState {
             } else if self.start_menu_open {
                 if let Some(item_idx) = self.start_menu_hit(mx, my, work_h) {
                     match item_idx {
-                        0..=4 => {
+                        0..=5 => {
                             self.start_menu_open = false;
                             if item_idx == 4 {
                                 self.files.refresh();
                             }
                             self.open_and_focus(item_idx);
                         }
-                        5 => {
+                        6 => {
                             self.theme = self.theme.next();
                         }
-                        6 => {
+                        7 => {
                             crate::serial_println!("[wmos] reboot requested");
                             cpu::reboot();
                         }
-                        7 => {
+                        8 => {
                             crate::serial_println!("[wmos] poweroff requested");
                             cpu::shutdown();
                         }
@@ -346,6 +350,8 @@ impl DesktopState {
                         } else if changed {
                             dirty_win = Some(4);
                         }
+                    } else if idx == 5 && self.iot.handle_mouse(&self.wins[5], mx, my, true) {
+                        dirty_win = Some(5);
                     }
                 }
             }
@@ -629,6 +635,7 @@ impl DesktopState {
                 .notepad
                 .render(&mut self.fb, &self.wins[3], self.last_cursor_blink),
             4 => self.files.render(&mut self.fb, &self.wins[4]),
+            5 => self.iot.render(&mut self.fb, &self.wins[5]),
             _ => {}
         }
     }
@@ -672,6 +679,7 @@ impl DesktopState {
             "WMOS Paint",
             "WMOS Notepad",
             "WMOS Files",
+            "WMOS IoT Hub",
             theme_buf.as_str(),
             "Reboot System",
             "Shutdown",
@@ -679,20 +687,20 @@ impl DesktopState {
 
         for (i, &label) in labels.iter().enumerate() {
             let iy = sy + 4 + i * START_MENU_ITEM_H;
-            if i == 5 || i == 6 {
+            if i == 6 || i == 7 {
                 self.fb
                     .draw_hline(sx + 6, iy, sw - 12, color::WIN_BORDER);
             }
-            let fg = if i >= 6 {
+            let fg = if i >= 7 {
                 color::TERM_AMBER
-            } else if i == 5 {
+            } else if i == 6 {
                 pal.accent_bright
             } else if i < WIN_COUNT && self.vis[i] == WindowVis::Open {
                 color::TERM_CYAN
             } else {
                 color::TEXT_PRIMARY
             };
-            self.fb.draw_str(sx + 12, iy + 8, label, fg, None);
+            self.fb.draw_str(sx + 12, iy + 7, label, fg, None);
         }
     }
 
@@ -930,7 +938,7 @@ fn render_desktop_header(fb: &mut Framebuffer, w: usize, work_h: usize) {
         fb.draw_str(
             24,
             14,
-            "WMOS v4.2.0 // x86_64 FAT32 RW + e1000 Net + Ring-3 ELF64",
+            "WMOS v5.0.0 // x86_64 FAT32 + e1000 TCP/HTTP/MQTT + IoT Hub",
             color::TEXT_MUTED,
             None,
         );
@@ -949,7 +957,7 @@ fn compute_initial_windows(
     w: usize,
     work_h: usize,
 ) -> ([Window; WIN_COUNT], [(usize, usize, usize, usize); WIN_COUNT]) {
-    let (r0, r1, r2, r3, r4) = if w >= 780 {
+    let (r0, r1, r2, r3, r4, r5) = if w >= 780 {
         let gap = if w >= 1000 { 24 } else { 16 };
         let side_margin = if w >= 1000 { 32 } else { 16 };
         let usable_w = w.saturating_sub(side_margin * 2 + gap);
@@ -977,12 +985,18 @@ fn compute_initial_windows(
         let fx = (start_x + 80).min(w.saturating_sub(fw + 8));
         let fy = (win_y + 32).min(work_h.saturating_sub(fh + 8));
 
+        let iw = 480usize.min(w.saturating_sub(40));
+        let ih = 324usize.min(work_h.saturating_sub(32));
+        let ix = (start_x + 70).min(w.saturating_sub(iw + 8));
+        let iy = (win_y + 28).min(work_h.saturating_sub(ih + 8));
+
         (
             (start_x, win_y, left_w, win_h),
             (start_x + left_w + gap, win_y, right_w, win_h),
             (px, py, pw, ph),
             (nx, ny, nw, nh),
             (fx, fy, fw, fh),
+            (ix, iy, iw, ih),
         )
     } else {
         let margin_x = 12usize.min(w / 16);
@@ -1002,6 +1016,7 @@ fn compute_initial_windows(
             (20, 20, pw, ph),
             (28, 28, pw, ph),
             (36, 36, pw, ph),
+            (24, 24, pw, ph),
         )
     };
 
@@ -1046,9 +1061,17 @@ fn compute_initial_windows(
             title: "WMOS Files",
             active: false,
         },
+        Window {
+            x: r5.0,
+            y: r5.1,
+            w: r5.2,
+            h: r5.3,
+            title: "WMOS IoT Hub",
+            active: false,
+        },
     ];
 
-    (wins, [r0, r1, r2, r3, r4])
+    (wins, [r0, r1, r2, r3, r4, r5])
 }
 
 fn draw_clipped_line(
@@ -1096,7 +1119,7 @@ fn render_system_info_content(
         y,
         max_w,
         max_y,
-        "OS      : wmos v4.2.0 (x86_64 no_std)",
+        "OS      : wmos v5.0.0 (x86_64 no_std)",
         color::TEXT_PRIMARY,
     );
     y += line_step;
@@ -1257,6 +1280,11 @@ fn render_system_info_content(
         "Ring-3  : Syscall + ELF64 READY",
         color::TERM_GREEN,
     );
+    y += line_step;
+
+    line.clear();
+    let _ = write!(line, "IoT     : {} devices (HTTP/MQTT/UDP/UART)", iot::list().len());
+    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_CYAN);
     y += line_step + 2;
 
     if y + 4 <= max_y {
@@ -1266,8 +1294,8 @@ fn render_system_info_content(
 
     let checklist: [(&str, Color); 4] = [
         ("[OK] Kernel : GDT/IDT/PIC/PMM/VMM/Heap", color::TERM_GREEN),
-        ("[OK] Drivers: PCI/AHCI/e1000/RTC/PS2", color::TERM_GREEN),
-        ("[OK] Storage: RAMFS + FAT32 RW + Files", color::TERM_GREEN),
+        ("[OK] Drivers: PCI/AHCI/e1000/COM2/PS2", color::TERM_GREEN),
+        ("[OK] Net/IoT: DHCP/TCP/HTTP/MQTT/UART", color::TERM_GREEN),
         ("[OK] User   : Ring-3 Syscall + ELF64", color::TERM_GREEN),
     ];
     for &(item, col) in &checklist {

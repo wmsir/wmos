@@ -10,7 +10,7 @@ if [[ ! -f "dist/wmos.iso" || ! -f "dist/wmos.img" ]]; then
     exit 1
 fi
 
-rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/qemu-uefi-reboot.log dist/wmos-persist-test.img dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock
+rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/qemu-uefi-reboot.log dist/iot-mock.log dist/wmos-persist-test.img dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock /tmp/wmos-mcu.sock
 
 echo "=== [1/3] Verifying dist/wmos.iso in QEMU Legacy BIOS mode ==="
 set +e
@@ -34,7 +34,7 @@ if [[ ${bios_rc} -ne 0 && ${bios_rc} -ne 124 ]]; then
     exit 1
 fi
 
-echo "=== [2/3] Verifying dist/wmos.iso + FAT32 disk write + e1000 net in QEMU UEFI (OVMF) Boot #1 ==="
+echo "=== [2/3] Verifying dist/wmos.iso + FAT32 + e1000 + IoT Hub (HTTP/MQTT/UDP/COM2 MCU) in QEMU UEFI (OVMF) Boot #1 ==="
 OVMF_CANDIDATES=(
     "/usr/share/OVMF/OVMF_CODE_4M.fd"
     "/usr/share/OVMF/OVMF_CODE.fd"
@@ -59,6 +59,15 @@ echo "Using OVMF firmware: ${OVMF_CODE}"
 cp dist/wmos.img dist/wmos-persist-test.img
 
 QEMU_PID=""
+MOCK_PID=""
+stop_mock() {
+    if [[ -n "${MOCK_PID}" ]] && kill -0 "${MOCK_PID}" 2>/dev/null; then
+        kill "${MOCK_PID}" 2>/dev/null || true
+        wait "${MOCK_PID}" 2>/dev/null || true
+    fi
+    MOCK_PID=""
+    rm -f /tmp/wmos-mcu.sock
+}
 stop_qemu() {
     if [[ -n "${QEMU_PID}" ]] && kill -0 "${QEMU_PID}" 2>/dev/null; then
         kill "${QEMU_PID}" 2>/dev/null || true
@@ -69,9 +78,166 @@ stop_qemu() {
 }
 cleanup_all() {
     stop_qemu
+    stop_mock
     rm -f dist/wmos-persist-test.img
 }
 trap cleanup_all EXIT
+
+python3 - <<'PY' &
+import os
+import socket
+import threading
+import time
+
+log_path = "dist/iot-mock.log"
+log_lock = threading.Lock()
+
+def log_event(msg: str) -> None:
+    with log_lock:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+            f.flush()
+
+def run_http_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 18080))
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(1.5)
+            data = b""
+            try:
+                while b"\r\n\r\n" not in data and len(data) < 4096:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+            first_line = data.split(b"\r\n", 1)[0].decode("utf-8", errors="replace").strip()
+            if first_line:
+                log_event(f"HTTP {first_line}")
+            resp = (
+                b"HTTP/1.0 200 OK\r\n"
+                b"Content-Type: application/json\r\n\r\n"
+                b'{"lamp":"on","temp":24}\n'
+            )
+            try:
+                conn.sendall(resp)
+            except OSError:
+                pass
+
+def read_mqtt_packet(conn: socket.socket, buf: bytearray):
+    while len(buf) < 2:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    pkt_type = buf[0]
+    mult = 1
+    rem_len = 0
+    idx = 1
+    while True:
+        while idx >= len(buf):
+            chunk = conn.recv(1024)
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        digit = buf[idx]
+        idx += 1
+        rem_len += (digit & 0x7F) * mult
+        if (digit & 0x80) == 0:
+            break
+        mult *= 128
+    total = idx + rem_len
+    while len(buf) < total:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    body = bytes(buf[idx:total])
+    del buf[:total]
+    return pkt_type, body
+
+def run_mqtt_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 11883))
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(2.0)
+            buf = bytearray()
+            try:
+                pkt1 = read_mqtt_packet(conn, buf)
+                if pkt1 and (pkt1[0] & 0xF0) == 0x10:
+                    conn.sendall(b"\x20\x02\x00\x00")
+                    while True:
+                        pkt = read_mqtt_packet(conn, buf)
+                        if pkt is None:
+                            break
+                        ptype, body = pkt
+                        if (ptype & 0xF0) == 0x30 and len(body) >= 2:
+                            tlen = (body[0] << 8) | body[1]
+                            topic = body[2:2 + tlen].decode("utf-8", errors="replace")
+                            payload_off = 2 + tlen
+                            if (ptype & 0x06) != 0 and payload_off + 2 <= len(body):
+                                payload_off += 2
+                            payload = body[payload_off:].decode("utf-8", errors="replace")
+                            log_event(f"MQTT {topic}={payload}")
+                        elif (ptype & 0xF0) == 0xE0:
+                            break
+            except OSError:
+                pass
+
+def run_udp_server() -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 18888))
+    while True:
+        data, addr = sock.recvfrom(2048)
+        msg = data.decode("utf-8", errors="replace").strip()
+        log_event(f"UDP {msg}")
+        sock.sendto(b'{"dev":"plug","state":"on"}', addr)
+
+def run_mcu_client() -> None:
+    mcu_sock = "/tmp/wmos-mcu.sock"
+    for _ in range(120):
+        if os.path.exists(mcu_sock):
+            break
+        time.sleep(0.1)
+    if not os.path.exists(mcu_sock):
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(mcu_sock)
+            buf = b""
+            while True:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line:
+                        log_event(f"MCU {line}")
+                        s.sendall(b"TEMP=24C LED=ON\n")
+    except OSError:
+        pass
+
+for fn in (run_http_server, run_mqtt_server, run_udp_server, run_mcu_client):
+    t = threading.Thread(target=fn, daemon=True)
+    t.start()
+
+while True:
+    time.sleep(1)
+PY
+MOCK_PID=$!
+sleep 0.2
 
 qemu-system-x86_64 \
     -M q35 \
@@ -84,6 +250,7 @@ qemu-system-x86_64 \
     -vga std \
     -display none \
     -serial file:dist/qemu-uefi.log \
+    -serial unix:/tmp/wmos-mcu.sock,server,nowait \
     -monitor unix:/tmp/wmos-mon.sock,server,nowait \
     -no-reboot \
     -no-shutdown &
@@ -168,22 +335,32 @@ if os.path.exists(sock_path):
             "cat demo.txt",
             "write /disk/persist.txt hello-v4",
             "ifconfig",
+            "dhcp",
+            "http 10.0.2.2 18080 /iot/lamp/on",
+            "mqtt 10.0.2.2 11883 home/lamp on",
+            "iot toggle plug",
+            "mcu temp",
             "ping 10.0.2.2",
             "exec /disk/bin/hello.elf",
-            "open files",
+            "open iot",
         ):
             send_command(s, cmd)
 
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 12.0
         while time.monotonic() < deadline:
             if os.path.exists(uefi_log_path):
                 with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
                     content = lf.read()
                     if (
                         "[wmos] fs disk write disk/persist.txt ok" in content
+                        and "[wmos] dhcp ok ip=10.0.2.15" in content
+                        and "[wmos] http ok 10.0.2.2:18080/iot/lamp/on" in content
+                        and "[wmos] mqtt ok home/lamp=on" in content
+                        and "[wmos] iot toggle plug ok" in content
+                        and "[wmos] mcu ok TEMP=24C" in content
                         and "[wmos] ping 10.0.2.2 ok" in content
                         and "[wmos] user elf exit=0" in content
-                        and "[wmos] cmd: open files" in content
+                        and "[wmos] cmd: open iot" in content
                     ):
                         break
             time.sleep(0.1)
@@ -194,6 +371,7 @@ PY
 fi
 
 stop_qemu
+stop_mock
 
 if [[ -f dist/boot-preview.ppm ]]; then
     python3 - <<'PY' || true
@@ -308,6 +486,8 @@ assert_log() {
         "[wmos] pci ok"
         "[wmos] ahci ok"
         "[wmos] sched ok"
+        "[wmos] com2 mcu uart ok"
+        "[wmos] iot hub ok"
         "[wmos] pit+ps2 ok"
         "[wmos] fb="
         "[wmos] fb double-buffer ok"
@@ -341,16 +521,42 @@ for uefi_marker in \
     "[wmos] cmd: write /disk/persist.txt hello-v4" \
     "[wmos] fs disk write disk/persist.txt ok" \
     "[wmos] cmd: ifconfig" \
+    "[wmos] cmd: dhcp" \
+    "[wmos] dhcp ok ip=10.0.2.15" \
+    "[wmos] http ok 10.0.2.2:18080/iot/lamp/on" \
+    "[wmos] mqtt ok home/lamp=on" \
+    "[wmos] iot toggle plug ok" \
+    "[wmos] mcu ok TEMP=24C" \
     "[wmos] cmd: ping 10.0.2.2" \
     "[wmos] ping 10.0.2.2 ok" \
     "[wmos] cmd: exec /disk/bin/hello.elf" \
     "[wmos] user: Hello from WMOS Ring-3 ELF64 userland!" \
     "[wmos] user: Syscall ABI verified (CPL=3 -> Ring 0 -> CPL=3)." \
     "[wmos] user elf exit=0" \
-    "[wmos] cmd: open files"
+    "[wmos] cmd: open iot"
 do
     if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
         echo "ERROR: UEFI log missing interactive marker: ${uefi_marker}" >&2
+        exit 1
+    fi
+done
+
+echo "--- Mock IoT Hub log (dist/iot-mock.log) ---"
+if [[ ! -f "dist/iot-mock.log" ]]; then
+    echo "ERROR: dist/iot-mock.log missing" >&2
+    exit 1
+fi
+cat dist/iot-mock.log
+echo "--- end Mock IoT Hub log ---"
+
+for iot_marker in \
+    "HTTP GET /iot/lamp/on" \
+    "MQTT home/lamp=on" \
+    "UDP ON" \
+    "MCU temp"
+do
+    if ! grep -qF "${iot_marker}" "dist/iot-mock.log"; then
+        echo "ERROR: dist/iot-mock.log missing marker: ${iot_marker}" >&2
         exit 1
     fi
 done
@@ -464,8 +670,9 @@ if ! grep -qF "[wmos] fs cat disk/persist.txt ok" "dist/qemu-uefi-reboot.log"; t
 fi
 
 echo "=== Verification Summary ==="
-echo "BIOS log: PASSED (all 18 required markers present, no PANIC/EXCEPTION)"
-echo "UEFI Boot #1 log: PASSED (all 18 + interactive + FAT32 write + e1000/ping + Ring-3 ELF64 markers present)"
+echo "BIOS log: PASSED (all 20 required markers present, no PANIC/EXCEPTION)"
+echo "UEFI Boot #1 log: PASSED (all 20 + FAT32 + e1000/DHCP/HTTP/MQTT/UDP/COM2 MCU + Ring-3 ELF64 markers present)"
+echo "Mock IoT Hub log: PASSED (HTTP GET, MQTT PUBLISH, UDP ON, MCU temp verified)"
 echo "mtools check: PASSED (::/PERSIST.TXT contains 'hello-v4')"
 echo "UEFI Boot #2 (cold reboot): PASSED ('[wmos] fs cat disk/persist.txt ok', no PANIC/EXCEPTION)"
 if [[ -f dist/boot-preview.png ]]; then

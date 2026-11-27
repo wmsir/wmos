@@ -8,8 +8,9 @@ use crate::drivers::keyboard::{self, KeyEvent};
 use crate::drivers::{ahci, e1000, mouse, pci};
 use crate::fs;
 use crate::gfx::color::{self, Color, Theme};
+use crate::iot;
 use crate::mem::{heap, pmm, vmm};
-use crate::net;
+use crate::net::{self, tcp};
 use crate::task::{self, TaskState};
 use crate::user::elf;
 
@@ -19,13 +20,13 @@ const MAX_INPUT_LEN: usize = 96;
 const MIB: u64 = 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
-const COMMANDS: [&str; 26] = [
+const COMMANDS: [&str; 32] = [
     "help", "info", "mem", "date", "uptime", "ls", "cat", "write", "append", "touch", "rm",
-    "stat", "open", "exec", "lspci", "ps", "disks", "ifconfig", "ping", "udp", "theme", "echo",
-    "clear", "about", "reboot", "poweroff",
+    "stat", "open", "exec", "lspci", "ps", "disks", "ifconfig", "ping", "udp", "dhcp", "ipset",
+    "http", "mqtt", "mcu", "iot", "theme", "echo", "clear", "about", "reboot", "poweroff",
 ];
 
-const APP_NAMES: [&str; 5] = ["info", "term", "paint", "notepad", "files"];
+const APP_NAMES: [&str; 6] = ["info", "term", "paint", "notepad", "files", "iot"];
 const THEME_NAMES: [&str; 3] = ["dark", "ocean", "amber"];
 
 #[derive(Clone, PartialEq, Eq)]
@@ -295,7 +296,7 @@ impl TerminalState {
                 color::TERM_CYAN,
             );
             self.push_line(
-                "Net : ifconfig, ping [ip], udp <ip> <port> <msg>",
+                "Net : ifconfig, dhcp, ipset, ping, udp, http, mqtt, mcu, iot",
                 color::TERM_CYAN,
             );
             self.push_line(
@@ -303,12 +304,12 @@ impl TerminalState {
                 color::TERM_GREEN,
             );
             self.push_line(
-                "Apps: open <info|term|paint|notepad|files>, exec <path>, echo, clear, about",
+                "Apps: open <info|term|paint|notepad|files|iot>, exec <path>, echo, clear, about",
                 color::TEXT_MUTED,
             );
         } else if cmd == "info" {
             self.push_line(
-                "OS: wmos v4.2.0 | Arch: x86_64 (Rust no_std)",
+                "OS: wmos v5.0.0 | Arch: x86_64 (Rust no_std)",
                 color::TEXT_PRIMARY,
             );
             self.push_line(
@@ -577,6 +578,7 @@ impl TerminalState {
                 "paint" => Some(2),
                 "notepad" | "note" => Some(3),
                 "files" | "explorer" => Some(4),
+                "iot" | "iothub" => Some(5),
                 _ => None,
             };
             if let Some(app_idx) = idx {
@@ -584,7 +586,7 @@ impl TerminalState {
                 return ShellAction::OpenApp(app_idx);
             } else {
                 self.push_line(
-                    "Unknown app. Use: open <info|term|paint|notepad|files>",
+                    "Unknown app. Use: open <info|term|paint|notepad|files|iot>",
                     color::TERM_AMBER,
                 );
             }
@@ -738,6 +740,190 @@ impl TerminalState {
                     }
                 }
             }
+        } else if cmd == "dhcp" {
+            if !net::is_up() {
+                self.push_line("Network interface is down", color::DOT_RED);
+            } else {
+                match net::dhcp_acquire() {
+                    Ok(cfg) => {
+                        crate::serial_println!(
+                            "[wmos] dhcp ok ip={}.{}.{}.{} gw={}.{}.{}.{}",
+                            cfg.ip[0],
+                            cfg.ip[1],
+                            cfg.ip[2],
+                            cfg.ip[3],
+                            cfg.gateway[0],
+                            cfg.gateway[1],
+                            cfg.gateway[2],
+                            cfg.gateway[3]
+                        );
+                        self.push_line(
+                            &format!(
+                                "DHCP lease: {}.{}.{}.{} mask {}.{}.{}.{} gw {}.{}.{}.{}",
+                                cfg.ip[0],
+                                cfg.ip[1],
+                                cfg.ip[2],
+                                cfg.ip[3],
+                                cfg.netmask[0],
+                                cfg.netmask[1],
+                                cfg.netmask[2],
+                                cfg.netmask[3],
+                                cfg.gateway[0],
+                                cfg.gateway[1],
+                                cfg.gateway[2],
+                                cfg.gateway[3]
+                            ),
+                            color::TERM_GREEN,
+                        );
+                    }
+                    Err(e) => self.push_line(e, color::DOT_RED),
+                }
+            }
+        } else if cmd == "ipset" {
+            self.push_line("Usage: ipset <ip> <gw>", color::TERM_AMBER);
+        } else if let Some(rest) = cmd.strip_prefix("ipset ") {
+            if let Some((ip_s, gw_s)) = rest.trim().split_once(' ') {
+                if let (Some(ip), Some(gw)) =
+                    (net::parse_ipv4(ip_s.trim()), net::parse_ipv4(gw_s.trim()))
+                {
+                    net::set_config(ip, [255, 255, 255, 0], gw);
+                    self.push_line(
+                        &format!(
+                            "Configured IP {}.{}.{}.{}/24 gw {}.{}.{}.{}",
+                            ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3]
+                        ),
+                        color::TERM_GREEN,
+                    );
+                } else {
+                    self.push_line("Invalid IPv4. Usage: ipset <ip> <gw>", color::DOT_RED);
+                }
+            } else {
+                self.push_line("Usage: ipset <ip> <gw>", color::TERM_AMBER);
+            }
+        } else if cmd == "http" {
+            self.push_line("Usage: http <ip> <port> <path>", color::TERM_AMBER);
+        } else if let Some(rest) = cmd.strip_prefix("http ") {
+            if !net::is_up() {
+                self.push_line("Network interface is down", color::DOT_RED);
+            } else {
+                let mut parts = rest.split_whitespace();
+                let ip_opt = parts.next().and_then(net::parse_ipv4);
+                let port_opt = parts.next().and_then(|s| s.parse::<u16>().ok());
+                let path = parts.next().unwrap_or("/");
+                if let (Some(ip), Some(port)) = (ip_opt, port_opt) {
+                    match tcp::http_get(ip, port, path) {
+                        Ok(resp) => {
+                            crate::serial_println!(
+                                "[wmos] http ok {}.{}.{}.{}:{}{}",
+                                ip[0],
+                                ip[1],
+                                ip[2],
+                                ip[3],
+                                port,
+                                path
+                            );
+                            for line in resp.lines().take(3) {
+                                self.push_line(line, color::TERM_GREEN);
+                            }
+                        }
+                        Err(e) => self.push_line(e, color::DOT_RED),
+                    }
+                } else {
+                    self.push_line("Usage: http <ip> <port> <path>", color::TERM_AMBER);
+                }
+            }
+        } else if cmd == "mqtt" {
+            self.push_line("Usage: mqtt <ip> <port> <topic> <msg>", color::TERM_AMBER);
+        } else if let Some(rest) = cmd.strip_prefix("mqtt ") {
+            if !net::is_up() {
+                self.push_line("Network interface is down", color::DOT_RED);
+            } else {
+                let trimmed = rest.trim_start();
+                let mut parsed = None;
+                if let Some((ip_s, a1)) = trimmed.split_once(' ') {
+                    let a1 = a1.trim_start();
+                    if let Some((port_s, a2)) = a1.split_once(' ') {
+                        let a2 = a2.trim_start();
+                        if let Some((topic, msg)) = a2.split_once(' ') {
+                            if let (Some(ip), Ok(port)) =
+                                (net::parse_ipv4(ip_s.trim()), port_s.trim().parse::<u16>())
+                            {
+                                parsed = Some((ip, port, topic.trim(), msg.trim_start()));
+                            }
+                        }
+                    }
+                }
+                match parsed {
+                    Some((ip, port, topic, msg)) => {
+                        match tcp::mqtt_publish(ip, port, topic, msg) {
+                            Ok(()) => {
+                                crate::serial_println!("[wmos] mqtt ok {}={}", topic, msg);
+                                self.push_line(
+                                    &format!(
+                                        "MQTT published {}={} -> {}.{}.{}.{}:{}",
+                                        topic, msg, ip[0], ip[1], ip[2], ip[3], port
+                                    ),
+                                    color::TERM_GREEN,
+                                );
+                            }
+                            Err(e) => self.push_line(e, color::DOT_RED),
+                        }
+                    }
+                    None => {
+                        self.push_line("Usage: mqtt <ip> <port> <topic> <msg>", color::TERM_AMBER);
+                    }
+                }
+            }
+        } else if cmd == "mcu" {
+            self.push_line("Usage: mcu <cmd>", color::TERM_AMBER);
+        } else if let Some(arg) = cmd.strip_prefix("mcu ") {
+            let mcu_cmd = arg.trim();
+            match iot::mcu_send(mcu_cmd) {
+                Ok(reply) => self.push_line(&format!("MCU> {}", reply), color::TERM_GREEN),
+                Err(e) => self.push_line(e, color::DOT_RED),
+            }
+        } else if cmd == "iot" || cmd == "iot list" {
+            for dev in iot::list() {
+                let st = if dev.on { "ON " } else { "OFF" };
+                self.push_line(
+                    &format!(
+                        "{:4} | {:18} | {} | {}",
+                        dev.id, dev.name, st, dev.last_reply
+                    ),
+                    color::TEXT_PRIMARY,
+                );
+            }
+        } else if let Some(rest) = cmd.strip_prefix("iot ") {
+            let sub = rest.trim();
+            if let Some(id) = sub.strip_prefix("toggle ") {
+                match iot::toggle(id.trim()) {
+                    Ok(reply) => {
+                        self.push_line(&format!("{} -> {}", id.trim(), reply), color::TERM_GREEN)
+                    }
+                    Err(e) => self.push_line(e, color::DOT_RED),
+                }
+            } else if let Some(set_args) = sub.strip_prefix("set ") {
+                let mut parts = set_args.split_whitespace();
+                let id_opt = parts.next();
+                let ip_opt = parts.next().and_then(net::parse_ipv4);
+                let port_opt = parts.next().and_then(|s| s.parse::<u16>().ok());
+                if let (Some(id), Some(ip), Some(port)) = (id_opt, ip_opt, port_opt) {
+                    match iot::set_endpoint(id, ip, port) {
+                        Ok(()) => self.push_line(
+                            &format!(
+                                "Updated {} -> {}.{}.{}.{}:{}",
+                                id, ip[0], ip[1], ip[2], ip[3], port
+                            ),
+                            color::TERM_GREEN,
+                        ),
+                        Err(e) => self.push_line(e, color::DOT_RED),
+                    }
+                } else {
+                    self.push_line("Usage: iot set <id> <ip> <port>", color::TERM_AMBER);
+                }
+            } else {
+                self.push_line("Usage: iot <list|toggle <id>|set <id> <ip> <port>>", color::TERM_AMBER);
+            }
         } else if cmd == "exec" {
             self.push_line("Usage: exec <path>", color::TERM_AMBER);
         } else if let Some(arg) = cmd.strip_prefix("exec ") {
@@ -769,11 +955,11 @@ impl TerminalState {
             self.lines.clear();
         } else if cmd == "about" {
             self.push_line(
-                "wmos v4.2.0 - Minimal x86_64 Rust no_std OS",
+                "wmos v5.0.0 - Minimal x86_64 Rust no_std OS",
                 color::TERM_CYAN,
             );
             self.push_line(
-                "GDT/IDT/PMM/VMM/Heap + PCI/AHCI/FAT32 + e1000/Net + Ring-3 ELF64",
+                "FAT32 RW + e1000 DHCP/TCP/HTTP/MQTT + COM2 MCU + Ring-3 ELF64",
                 color::TEXT_MUTED,
             );
         } else if cmd == "reboot" {

@@ -7,6 +7,8 @@ use crate::fs;
 use crate::gfx::color::{self, Color};
 use crate::gfx::fb::Framebuffer;
 use crate::gfx::ui::{BORDER_W, Window};
+use crate::iot::{self, DeviceKind};
+use crate::net;
 
 const TOOLBAR_H: usize = 28;
 
@@ -677,4 +679,213 @@ fn draw_button(
     let tx = x + w.saturating_sub(text_w) / 2;
     let ty = y + h.saturating_sub(8) / 2;
     fb.draw_str(tx, ty, label, color::TEXT_PRIMARY, None);
+}
+
+pub struct IotApp {
+    status: String,
+}
+
+impl IotApp {
+    pub fn new() -> Self {
+        Self {
+            status: String::from("Ready"),
+        }
+    }
+
+    pub fn handle_mouse(
+        &mut self,
+        win: &Window,
+        mx: usize,
+        my: usize,
+        just_pressed: bool,
+    ) -> bool {
+        if !just_pressed {
+            return false;
+        }
+        let (ox, oy) = win.client_origin();
+        let cw = win.w.saturating_sub(BORDER_W * 2);
+        let ch = (win.y + win.h).saturating_sub(oy + BORDER_W);
+
+        let by = oy + 5;
+        if my >= by && my < by + 18 {
+            if mx >= ox + 140 && mx < ox + 188 {
+                match net::dhcp_acquire() {
+                    Ok(cfg) => {
+                        self.status = format!(
+                            "DHCP {}.{}.{}.{}",
+                            cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]
+                        );
+                    }
+                    Err(e) => {
+                        self.status = String::from(e);
+                    }
+                }
+                return true;
+            }
+            if mx >= ox + 194 && mx < ox + 258 {
+                self.status = String::from("Refreshed");
+                return true;
+            }
+        }
+
+        let ex = ox + 6;
+        let ey = oy + TOOLBAR_H + 6;
+        let ew = cw.saturating_sub(12);
+        let eh = ch.saturating_sub(TOOLBAR_H + 12);
+        if ew < 130 || eh < 48 {
+            return false;
+        }
+
+        let row_h = 56usize;
+        let max_rows = eh.saturating_sub(8) / row_h;
+        let devices = iot::list();
+        for (i, dev) in devices.iter().take(max_rows).enumerate() {
+            let ry = ey + 4 + i * row_h;
+            let toggle_x = ex + ew - 68;
+            if mx >= toggle_x && mx < toggle_x + 60 && my >= ry + 5 && my < ry + 23 {
+                match iot::toggle(dev.id) {
+                    Ok(reply) => {
+                        self.status = format!("{}: {}", dev.id, reply);
+                    }
+                    Err(e) => {
+                        self.status = format!("{}: {}", dev.id, e);
+                    }
+                }
+                return true;
+            }
+            if dev.kind == DeviceKind::UartMcu {
+                let temp_x = ex + ew - 120;
+                if mx >= temp_x && mx < temp_x + 46 && my >= ry + 5 && my < ry + 23 {
+                    match iot::mcu_send("temp") {
+                        Ok(reply) => {
+                            self.status = format!("mcu: {}", reply);
+                        }
+                        Err(e) => {
+                            self.status = String::from(e);
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn render(&self, fb: &mut Framebuffer, win: &Window) {
+        let (ox, oy) = win.client_origin();
+        let cw = win.w.saturating_sub(BORDER_W * 2);
+        let ch = (win.y + win.h).saturating_sub(oy + BORDER_W);
+        if cw < 64 || ch < TOOLBAR_H + 32 {
+            return;
+        }
+
+        fb.fill_rect(ox, oy, cw, ch, color::WIN_BG);
+        fb.fill_rect(ox, oy, cw, TOOLBAR_H, color::WIN_TITLE_INACTIVE);
+        fb.draw_hline(ox, oy + TOOLBAR_H, cw, color::WIN_BORDER);
+
+        let ip_label = if net::is_up() {
+            let cfg = net::config();
+            format!("IP {}.{}.{}.{}", cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3])
+        } else {
+            String::from("Net: Offline")
+        };
+        for (i, ch_val) in ip_label.chars().take(16).enumerate() {
+            fb.draw_char(ox + 8 + i * 8, oy + 10, ch_val, color::TERM_CYAN, None);
+        }
+
+        let by = oy + 5;
+        if ox + 262 < ox + cw {
+            draw_button(fb, ox + 140, by, 48, 18, "DHCP", color::TASKBAR_TAB_ACTIVE);
+            draw_button(fb, ox + 194, by, 64, 18, "Refresh", color::TASKBAR_TAB_INACTIVE);
+        }
+
+        let max_st_chars = cw.saturating_sub(268) / 8;
+        if max_st_chars > 0 {
+            let st_len = self.status.len().min(max_st_chars);
+            let sx = ox + cw - st_len * 8 - 8;
+            for (i, ch_val) in self.status.chars().take(st_len).enumerate() {
+                fb.draw_char(sx + i * 8, oy + 10, ch_val, color::TERM_GREEN, None);
+            }
+        }
+
+        let ex = ox + 6;
+        let ey = oy + TOOLBAR_H + 6;
+        let ew = cw.saturating_sub(12);
+        let eh = ch.saturating_sub(TOOLBAR_H + 12);
+        if ew < 48 || eh < 48 {
+            return;
+        }
+
+        fb.fill_rect(ex, ey, ew, eh, color::TERM_BG);
+        fb.draw_rect_outline(ex, ey, ew, eh, 1, color::WIN_BORDER);
+
+        let row_h = 56usize;
+        let max_rows = eh.saturating_sub(8) / row_h;
+        let devices = iot::list();
+        for (i, dev) in devices.iter().take(max_rows).enumerate() {
+            let ry = ey + 4 + i * row_h;
+            fb.fill_rect(ex + 4, ry + 2, ew.saturating_sub(8), row_h - 4, color::WIN_BG);
+            fb.draw_rect_outline(ex + 4, ry + 2, ew.saturating_sub(8), row_h - 4, 1, color::WIN_BORDER);
+
+            let badge = if dev.on { "[ON ]" } else { "[OFF]" };
+            let badge_col = if dev.on { color::TERM_GREEN } else { color::TEXT_MUTED };
+            fb.draw_str(ex + 10, ry + 9, badge, badge_col, None);
+
+            let name_max = ew.saturating_sub(196) / 8;
+            for (ci, ch_val) in dev.name.chars().take(name_max).enumerate() {
+                fb.draw_char(ex + 56 + ci * 8, ry + 9, ch_val, color::TEXT_PRIMARY, None);
+            }
+
+            if ew >= 140 {
+                let toggle_x = ex + ew - 68;
+                draw_button(
+                    fb,
+                    toggle_x,
+                    ry + 6,
+                    60,
+                    18,
+                    "Toggle",
+                    color::TASKBAR_TAB_ACTIVE,
+                );
+                if dev.kind == DeviceKind::UartMcu && ew >= 190 {
+                    let temp_x = ex + ew - 120;
+                    draw_button(
+                        fb,
+                        temp_x,
+                        ry + 6,
+                        46,
+                        18,
+                        "Temp",
+                        color::TASKBAR_TAB_INACTIVE,
+                    );
+                }
+            }
+
+            let endpoint = match dev.kind {
+                DeviceKind::WifiHttp => format!(
+                    "HTTP {}.{}.{}.{}:{} {}",
+                    dev.ip[0], dev.ip[1], dev.ip[2], dev.ip[3], dev.port, dev.target
+                ),
+                DeviceKind::WifiMqtt => format!(
+                    "MQTT {}.{}.{}.{}:{} {}",
+                    dev.ip[0], dev.ip[1], dev.ip[2], dev.ip[3], dev.port, dev.target
+                ),
+                DeviceKind::WifiUdp => format!(
+                    "UDP  {}.{}.{}.{}:{}",
+                    dev.ip[0], dev.ip[1], dev.ip[2], dev.ip[3], dev.port
+                ),
+                DeviceKind::UartMcu => format!("UART COM2 {:#x} {}", dev.port, dev.target),
+            };
+            let reply = if dev.last_reply.is_empty() {
+                String::from("-")
+            } else {
+                dev.last_reply.clone()
+            };
+            let line2 = format!("{} | {}", endpoint, reply);
+            let max_cols = ew.saturating_sub(20) / 8;
+            for (ci, ch_val) in line2.chars().take(max_cols).enumerate() {
+                fb.draw_char(ex + 10 + ci * 8, ry + 32, ch_val, color::TERM_CYAN, None);
+            }
+        }
+    }
 }

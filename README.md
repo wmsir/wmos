@@ -1,6 +1,6 @@
-# WMOS (`v4.2.0`) — x86_64 Rust Micro-OS
+# WMOS (`v5.0.0`) — x86_64 Rust Micro-OS
 
-基于 Rust (`#![no_std]`, 100% Stable, `alloc`) 与 Limine 引导协议构建的独立 `x86_64` 微内核桌面操作系统，集成了 PCI 总线枚举、AHCI SATA DMA 读写驱动、GPT FAT32 `/disk/<8.3>` 磁盘持久化、Intel e1000 网卡 DMA 驱动与 IPv4/ARP/ICMP/UDP 协议栈（`ifconfig`/`ping`/`udp`）、Ring-3 用户态隔离（`syscall`/`sysret` 与 ELF64 加载器）、3 任务协作式调度器、PMM/VMM/内核堆、CMOS RTC、RAMFS、双缓冲多主题桌面（`System Info` / `WMOS Terminal` / `WMOS Paint` / `WMOS Notepad` / `WMOS Files`）、ACPI 关机以及无头 QEMU BIOS/UEFI + 磁盘冷重启持久化 + 网络 + Ring-3 ELF64 执行全自动 CI 验证。
+基于 Rust (`#![no_std]`, 100% Stable, `alloc`) 与 Limine 引导协议构建的独立 `x86_64` 微内核桌面操作系统，集成了 PCI 总线枚举、AHCI SATA DMA 读写驱动、GPT FAT32 `/disk/<8.3>` 磁盘持久化、Intel e1000 网卡 DMA 驱动、完整 IPv4/ARP/DHCP/ICMP/UDP/TCP/HTTP/MQTT 网络协议栈、COM2 外设 MCU UART 驱动与 `WMOS IoT Hub` 智能家居控制台、Ring-3 用户态隔离（`syscall`/`sysret` 与 ELF64 加载器）、3 任务协作式调度器、PMM/VMM/内核堆、CMOS RTC、RAMFS、双缓冲 6 窗口多主题桌面、ACPI 关机以及无头 QEMU BIOS/UEFI + 磁盘持久化 + IoT 全协议栈全自动 CI 验证与 Release 发布。
 
 GitHub 仓库：`https://github.com/wmsir/wmos`
 
@@ -10,32 +10,33 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 
 > **强制同步原则**：任何代码、配置、脚本或 CI 工作流变更，**必须在同一次提交中同步更新文档**，确保文档与实现 100% 一致。
 
-- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、内存/MMIO 映射、启动时序与串口契约、PCI/AHCI/e1000/FAT32/网络栈/Ring-3 ELF64/调度器/GUI 子系统设计、镜像构建及 QEMU 校验体系
+- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、内存/MMIO 映射、启动时序与串口契约、PCI/AHCI/e1000/FAT32/TCP-HTTP-MQTT/IoT/Ring-3 ELF64/GUI 子系统设计、镜像构建及 QEMU 校验体系
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — 版本里程碑与每次变更的代码级追踪记录
 - **[AGENTS.md](AGENTS.md)** — 强制文档同步规则、Rust Stable `#![no_std]` 内核约束与 `.sh` 纯 LF 行尾规范
 
 ---
 
-## 核心特性（`v4.2.0`）
+## 核心特性（`v5.0.0`）
 
 - **引导、架构与 Ring-3 用户态隔离**：
   - Limine v10 高半核 ELF64 引导（`0xffffffff80000000`），解析 HHDM、物理内存映射与线性帧缓冲。
   - **7 项 64 位 GDT / TSS / IDT / 8259 PIC / 100 Hz PIT**：配置 `KERNEL_CS`/`KERNEL_DS`/`USER_DS (0x1B)`/`USER_CS (0x23)` 与独立 16 KiB `TSS_RSP0_STACK`、`DOUBLE_FAULT_STACK`（IST1）；CPL=3 异常捕获与内核隔离恢复。
   - **`syscall`/`sysret` ABI 与 ELF64 加载器**：编程 `IA32_EFER.SCE` / `STAR` / `LSTAR` / `FMASK`，支持 `SYS_WRITE (1)`、`SYS_GETPID (20)`、`SYS_EXIT (60)`、`SYS_UPTIME (96)`；通过 `UserAddressSpace` 隔离加载静态 `ET_EXEC` `x86_64` ELF64 并内置示例程序 `/disk/bin/hello.elf`（`exec /disk/bin/hello.elf`）。
-  - **CMOS RTC & ACPI 电源管理**：读取 `0x70`/`0x71` 实时时钟；支持 PS/2 `reboot` 与 QEMU/Bochs/VirtualBox ACPI I/O 端口 `shutdown`。
+  - **COM1 + COM2 双串口、CMOS RTC & ACPI 电源管理**：COM1 (`0x3F8`) 输出内核日志，COM2 (`0x2F8`, `115200 8N1`) 支持面向外部 MCU 的双向行命令通信；读取 `0x70`/`0x71` 实时时钟；支持 PS/2 `reboot` 与 ACPI I/O 端口 `shutdown`。
   - **协作式多任务调度器**：基于 `global_asm!` `switch_context` 运行 3 个 16 KiB 栈内核任务（`desktop-ui`、`sys-monitor`、`idle-worker`）。
-- **内存管理、存储与网络**：
+- **内存管理、存储、网络与智能家居 IoT Hub**：
   - **PMM / VMM / Kernel Heap**：4 KiB 位图 PMM（最高 4 GiB）、4 级页表 VMM（支持 `USER_ACCESSIBLE`、独立 `UserAddressSpace` 与 `WRITE_THROUGH` / `CACHE_DISABLE` MMIO 映射）与 `0xFFFF_A000_0000_0000` 合并式全局堆。
-  - **PCI + AHCI SATA DMA + GPT FAT32 `/disk/` 持久化**：扫描 PCI 总线 `0..=7`，通过 AHCI `IDENTIFY`、`READ_DMA_EXT`、`WRITE_DMA_EXT` 与 `FLUSH_CACHE_EXT` 读写 SATA 磁盘；支持根目录 `/disk/<8.3>` 文件的创建、覆盖、追加与删除落盘（`/disk/boot` 与 `/disk/EFI` 子目录受写保护），并与可读写 RAMFS（`readme.txt`、`motd.txt`、`notes.txt`）统一访问。
-  - **Intel e1000 NIC + IPv4/ARP/ICMP/UDP 协议栈**：支持 Intel `0x100E`/`0x10D3`/`0x100F`/`0x1004` 网卡 16 槽 RX/TX DMA 收发环，配置静态 QEMU SLIRP 地址 `10.0.2.15/24`（网关 `10.0.2.2`），内置 ARP 缓存与解析、ICMP Echo 探测（带 RTT 统计与自动回复）及 UDP 数据报发送。
-- **双缓冲多主题桌面与 26 命令终端**：
-  - **5 窗口与 3 套主题**：支持 `Dark` / `Ocean` / `Amber` 实时切换，集成 `System Info`（含实时 `Net` IPv4 与 `Ring-3 : Syscall + ELF64 READY` 状态）、`WMOS Terminal`、`WMOS Paint`、`WMOS Notepad`（支持直接保存根目录 `/disk/<8.3>` 文件至 FAT32 磁盘，子目录受保护为 `ReadOnly`）与 `WMOS Files`（浏览 RAMFS 与 FAT32 `/disk/`、打开至 Notepad 及删除可写磁盘文件）。
-  - **8 项 Start 菜单与动态任务栏**：支持窗口关闭/最小化/重置、动态防遮挡任务栏标签及右下角 CMOS RTC 时钟与光标托盘。
-  - **`WMOS Terminal`（26 条命令 + 历史 + Tab 补全）**：
+  - **PCI + AHCI SATA DMA + GPT FAT32 `/disk/` 持久化**：扫描 PCI 总线 `0..=7`，通过 AHCI `IDENTIFY`、`READ_DMA_EXT`、`WRITE_DMA_EXT` 与 `FLUSH_CACHE_EXT` 读写 SATA 磁盘；支持根目录 `/disk/<8.3>` 文件创建、覆盖、追加与删除落盘（`/disk/boot` 与 `/disk/EFI` 子目录受写保护），并与 RAMFS（`readme.txt`、`motd.txt`、`notes.txt`）统一访问。
+  - **Intel e1000 NIC + IPv4/ARP/DHCP/ICMP/UDP/TCP/HTTP/MQTT 协议栈**：支持 Intel `0x100E`/`0x10D3`/`0x100F`/`0x1004` 网卡 16 槽 RX/TX DMA 收发环，支持 `DHCPDISCOVER`/`DHCPOFFER`/`DHCPREQUEST`/`DHCPACK` 自动租约与静态配置、ARP 解析、ICMP Echo 探测、UDP 双向交换（`udp_exchange`）、同步 TCP 状态机、HTTP/1.0 `GET` 与 MQTT 3.1.1 QoS-0 `PUBLISH`。
+  - **IoT 智能家居设备中心（`iot/mod.rs`）**：内置 4 类异构设备控制链路：`lamp`（`Desk Lamp (HTTP)`）、`ac`（`Living AC (MQTT)`）、`plug`（`Smart Plug (UDP)`）与 `mcu`（`ESP32 MCU (COM2)`）。
+- **双缓冲 6 窗口桌面与 32 命令终端**：
+  - **6 窗口与 3 套主题**：支持 `Dark` / `Ocean` / `Amber` 实时切换，集成 `System Info`、`WMOS Terminal`、`WMOS Paint`、`WMOS Notepad`（支持直接保存根目录 `/disk/<8.3>` 文件至 FAT32 磁盘）、`WMOS Files` 与 `WMOS IoT Hub`（含 `[DHCP]`/`[Refresh]`、4 设备状态徽章、`[Toggle]` 与 MCU `[Temp]` 快捷控制）。
+  - **9 项 Start 菜单与动态任务栏**：支持窗口关闭/最小化/重置、动态防遮挡 6 标签任务栏（`Info`/`Term`/`Paint`/`Note`/`Files`/`IoT`）及右下角 CMOS RTC 时钟与光标托盘。
+  - **`WMOS Terminal`（32 条命令 + 历史 + Tab 补全）**：
     - 系统与硬件：`help`、`info`、`mem`、`date`、`uptime`、`lspci`、`ps`、`disks`、`theme <dark|ocean|amber>`、`reboot`、`poweroff`
-    - 网络命令：`ifconfig`、`ping [ip]`、`udp <ip> <port> <msg>`
-    - 存储与文件：`ls [/disk]`、`cat <file>`（支持 `/disk/<path>`）、`write <file> <text>`、`append <file> <text>`、`touch <file>`、`rm <file>`、`stat <file>`（支持根目录 `/disk/<8.3>` 持久读写与删除）
-    - 用户态与工具：`exec <path>`（如 `exec /disk/bin/hello.elf`）、`open <info|term|paint|notepad|files>`、`open notepad <file>`、`echo <text>`、`clear`、`about`
+    - 网络与 IoT：`ifconfig`、`dhcp`、`ipset <ip> <gw>`、`ping [ip]`、`udp <ip> <port> <msg>`、`http <ip> <port> <path>`、`mqtt <ip> <port> <topic> <msg>`、`mcu <cmd>`、`iot list|toggle <id>|set <id> <ip> <port>`
+    - 存储与文件：`ls [/disk]`、`cat <file>`、`write <file> <text>`、`append <file> <text>`、`touch <file>`、`rm <file>`、`stat <file>`（支持根目录 `/disk/<8.3>` 持久读写与删除）
+    - 用户态与工具：`exec <path>`（如 `exec /disk/bin/hello.elf`）、`open <info|term|paint|notepad|files|iot>`、`open notepad <file>`、`echo <text>`、`clear`、`about`
 
 ---
 
@@ -56,7 +57,7 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 │   └── CHANGELOG.md              # 版本与变更追踪日志
 ├── scripts/
 │   ├── build-images.sh           # 编译 hello.elf 并生成 ISO / RAW / QCOW2 / VMDK / VHD 与 SHA256SUMS.txt
-│   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI（含 SATA 持久化、冷重启、e1000 与 Ring-3 ELF64）断言与截图导出
+│   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI（含 SATA、IoT Mock Hub/COM2 MCU 与 Ring-3 ELF64）断言与截图导出
 ├── user/
 │   └── hello.S                   # Ring-3 x86_64 汇编示例程序（链接打包为 /bin/hello.elf）
 └── kernel/
@@ -65,23 +66,25 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
     ├── build.rs                  # 传入 linker-x86_64.ld 链接脚本
     ├── linker-x86_64.ld          # 高半核 (0xffffffff80000000) ELF64 链接脚本
     └── src/
-        ├── main.rs               # kmain 初始化、syscall::init()、net::poll() 与调度主循环
+        ├── main.rs               # kmain 初始化、com2_init/iot::init、net::poll() 与调度主循环
         ├── boot_info.rs          # BootSummary / FramebufferInfo 引导信息抽象
-        ├── shell.rs              # WMOS Terminal（26 条命令、历史记录、/disk/ Tab 补全、网络与 exec 命令）
+        ├── shell.rs              # WMOS Terminal（32 条命令、历史记录、/disk/ Tab 补全、IoT 与 exec 命令）
         ├── task/mod.rs           # 3 任务协作式调度器与 global_asm! 上下文切换
         ├── user/                 # Ring-3 ELF64 校验与隔离执行器（mod.rs、elf.rs）
-        ├── net/mod.rs            # IPv4/ARP/ICMP/UDP 网络协议栈（10.0.2.15/24）
+        ├── net/                  # IPv4/ARP/DHCP/ICMP/UDP/TCP/HTTP/MQTT 协议栈（mod.rs、tcp.rs）
+        ├── iot/mod.rs            # IoT 智能家居设备注册表与 HTTP/MQTT/UDP/COM2 控制中心
         ├── fs/                   # 统一文件系统（RAMFS + fat32.rs GPT FAT32 读写与 8.3 持久化）
-        ├── arch/                 # x86_64 架构支持（cpu、io、serial、gdt、pic、pit、rtc、idt、syscall）
+        ├── arch/                 # x86_64 架构支持（cpu、io、serial COM1+COM2、gdt、pic、pit、rtc、idt、syscall）
+        ├── mem/                  # 内存管理（pmm 位图、vmm 4 级页表/用户空间、heap 全局分配器）
         ├── drivers/              # 设备驱动（pci、ahci SATA DMA、e1000 NIC DMA、ps2、keyboard、mouse）
-        └── gfx/                  # 字体、主题色板、双缓冲 Framebuffer、Paint/Notepad/Files 与桌面管理
+        └── gfx/                  # 字体、主题色板、双缓冲 Framebuffer、Paint/Notepad/Files/IoT Hub 与桌面管理
 ```
 
 ---
 
 ## 从 GitHub Releases 直接下载
 
-无需配置本地构建环境，直接前往仓库 Releases 页面即可下载已通过 QEMU BIOS/UEFI、SATA 持久化、e1000 网络与 Ring-3 ELF64 全量验证的正式版本镜像：
+无需配置本地构建环境，直接前往仓库 Releases 页面即可下载已通过 QEMU BIOS/UEFI、SATA 持久化、IoT 全协议栈（DHCP/HTTP/MQTT/UDP/COM2 MCU）与 Ring-3 ELF64 全量验证的正式版本镜像：
 
 - **Releases 页面**：https://github.com/wmsir/wmos/releases
 - **每次 `v*` 标签自动随附 7 项资产**：
@@ -114,9 +117,9 @@ git tag -a vX.Y.Z -m "Release WMOS vX.Y.Z" && git push origin vX.Y.Z
      - `wmos.vhd` — VirtualBox / Hyper-V 固定大小虚拟磁盘镜像
      - `SHA256SUMS.txt` — 所有镜像的 SHA-256 校验值
    - **`wmos-ci-logs-and-preview`**：包含 CI 验证日志与实时截图：
-     - `qemu-bios.log` — QEMU Legacy BIOS 串口启动日志（含 `[wmos] syscall+ring3 ok`）
-     - `qemu-uefi.log` — QEMU UEFI (OVMF) + AHCI SATA + e1000 串口启动、写入 `/disk/persist.txt`、`ifconfig` / `ping 10.0.2.2` 与 `exec /disk/bin/hello.elf` 交互日志
-     - `boot-preview.png` — UEFI 模式下自动执行全部终端/存储/网络/Ring-3 ELF64 验证命令后的实时桌面截图
+     - `qemu-bios.log` — QEMU Legacy BIOS 串口启动日志（含 `[wmos] syscall+ring3 ok`、`[wmos] com2 mcu uart ok`、`[wmos] iot hub ok`）
+     - `qemu-uefi.log` — QEMU UEFI (OVMF) + AHCI SATA + e1000 + COM2 MCU 串口启动、写入 `/disk/persist.txt`、`dhcp`/`http`/`mqtt`/`iot toggle plug`/`mcu temp`/`ping 10.0.2.2`、`exec /disk/bin/hello.elf` 与 `open iot` 交互日志
+     - `boot-preview.png` — UEFI 模式下自动执行全部 IoT/网络/存储/Ring-3 ELF64 验证命令并打开 `WMOS IoT Hub` 后的实时桌面截图
 
 ---
 
@@ -124,13 +127,14 @@ git tag -a vX.Y.Z -m "Release WMOS vX.Y.Z" && git push origin vX.Y.Z
 
 ### 1. QEMU（推荐）
 
-#### 运行 `.iso` + 挂载 SATA FAT32 磁盘与 Intel e1000 网卡（UEFI OVMF 模式，完整体验 `/disk/` 与网络）
+#### 运行 `.iso` + 挂载 SATA FAT32 磁盘、Intel e1000 网卡与 COM2 MCU（UEFI OVMF 模式）
 ```bash
 # Linux（固件路径常见为 /usr/share/OVMF/OVMF_CODE_4M.fd 或 /usr/share/OVMF/OVMF_CODE.fd）
 qemu-system-x86_64 -M q35 -m 256M \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
   -cdrom wmos.iso -drive file=wmos.img,format=raw \
-  -netdev user,id=net0 -device e1000,netdev=net0 -vga std -serial stdio
+  -netdev user,id=net0 -device e1000,netdev=net0 \
+  -vga std -serial stdio -serial unix:/tmp/wmos-mcu.sock,server,nowait
 ```
 
 #### 运行 `.iso`（Legacy BIOS 模式）
