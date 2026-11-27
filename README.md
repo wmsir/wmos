@@ -79,6 +79,26 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 
 ---
 
+## 从 GitHub Releases 直接下载
+
+无需配置本地构建环境，直接前往仓库 Releases 页面即可下载已通过 QEMU BIOS/UEFI、SATA 持久化、e1000 网络与 Ring-3 ELF64 全量验证的正式版本镜像：
+
+- **Releases 页面**：https://github.com/wmsir/wmos/releases
+- **每次 `v*` 标签自动随附 7 项资产**：
+  - `wmos.iso`（Hybrid BIOS + UEFI 可引导 ISO，内置 `/bin/hello.elf`）
+  - `wmos.img`（64 MiB GPT RAW 镜像，含 `::/bin/hello.elf`）
+  - `wmos.qcow2` / `wmos.vmdk` / `wmos.vhd`（QEMU / VMware / VirtualBox 磁盘镜像）
+  - `SHA256SUMS.txt`（全部镜像 SHA-256 校验文件）
+  - `boot-preview.png`（UEFI 实机验证桌面截图）
+
+推送带注释版本标签即可自动触发构建、校验与 Release 发布（仅在 `verify-qemu.sh` 全部通过后上传）：
+
+```bash
+git tag -a vX.Y.Z -m "Release WMOS vX.Y.Z" && git push origin vX.Y.Z
+```
+
+---
+
 ## 下载 GitHub Actions 构建产物
 
 每次推送到 `https://github.com/wmsir/wmos` 的 `main` 分支都会自动触发 **Build and Verify WMOS** 工作流，执行编译、镜像打包以及 QEMU Legacy BIOS / UEFI（含真实 SATA 盘 FAT32 写入、冷重启持久化、e1000 `ping 10.0.2.2` 与 `exec /disk/bin/hello.elf`）交互验证：

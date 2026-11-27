@@ -18,7 +18,22 @@
 
 ---
 
+## [Unreleased] - 2026-11-27
+
+- **变更类型**：`ci` / `docs`
+- **改动文件**：
+  - `.github/workflows/build.yml`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
+- **变更摘要**：
+  - **自动化 GitHub Release 发布（`.github/workflows/build.yml`）**：扩展 `push` 触发器以同时监听全部分支（`branches: ["**"]`）与版本标签（`tags: ["v*"]`）；为 `build-and-verify` 作业赋予 `permissions: contents: write`；在 QEMU 验证与日志上传后新增 `Publish GitHub Release` 步骤（`if: startsWith(github.ref, 'refs/tags/v')`），调用 `softprops/action-gh-release@v2`（`generate_release_notes: true`、`fail_on_unmatched_files: true`）自动发布 `dist/wmos.iso`、`dist/wmos.img`、`dist/wmos.qcow2`、`dist/wmos.vmdk`、`dist/wmos.vhd`、`dist/SHA256SUMS.txt` 与 `dist/boot-preview.png` 共 7 项 Release 资产。
+  - **文档同步**：更新 `docs/DESIGN.md` 第 6 节 CI/Release 流程与 `README.md` 从 GitHub Releases 下载及 `git tag` 发版指南，并补全 `[v4.2.0]` 的提交 SHA 与 CI Run 记录。
+- **验证结果**：
+  - `.github/workflows/build.yml` 无 Tab 字符与缩进语法检查通过，所有 Markdown 相对路径链接有效；待提交推送与打标 `v4.2.0` 后由 GitHub Actions 自动验证并发布 Release。
+
+---
+
 ## [v4.2.0] - 2026-11-27
+
+### `fa445d9` — Ring-3 用户态隔离、`syscall`/`sysret` ABI、ELF64 加载器与 `/bin/hello.elf` CI 验证
 
 - **变更类型**：`feat` / `ci` / `docs`
 - **改动文件**：
@@ -33,8 +48,7 @@
   - **ELF64 加载器与终端/桌面集成 (`user/elf.rs`、`shell.rs` & `gfx/desktop.rs`)**：实现 `ExecOutput` 与 `run_elf(bytes)`，校验 `ET_EXEC` / `EM_X86_64`、`PT_LOAD` 边界并映射 16 KiB 用户栈（`0x0000_7FFF_F000_0000..+0x4000`），同步运行后输出 `[wmos] user elf exit=<code>`；终端扩展至 26 条命令并新增 `exec <path>`，桌面顶栏与 `System Info` 升级至 `wmos v4.2.0` 并新增 `Ring-3  : Syscall + ELF64 READY`。
   - **用户态示例与 CI 闭环验证 (`user/hello.S` & `scripts/*.sh`)**：新增 AT&T 汇编 `user/hello.S`（调用 `SYS_WRITE`、`SYS_GETPID`、`SYS_UPTIME`、`SYS_EXIT`），由 `build-images.sh` 静态链接为 `dist/hello.elf`（`0x400000`）并打包至 ISO `/bin/hello.elf` 与磁盘 `::/bin/hello.elf`；`verify-qemu.sh` 在 BIOS/UEFI 双模式必检 `[wmos] syscall+ring3 ok`，并在 UEFI Boot #1 注入 `exec /disk/bin/hello.elf` 严格断言用户态输出与 `[wmos] user elf exit=0`。
 - **验证结果**：
-  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `425656` B，`e_entry=0xffffffff80023bc0`）；`user/hello.S` 汇编检查通过，`scripts/*.sh` 纯 LF 与零禁用标记检查通过。
-  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端编译、ELF64 链接打包与 QEMU 全流程验证。
+  - GitHub Actions Run [`45993761160`](https://github.com/wmsir/wmos/actions/runs/45993761160) 全绿通过（BIOS + UEFI Boot #1 `exec /disk/bin/hello.elf` 输出两行用户态日志与 `[wmos] user elf exit=0`、`ping 10.0.2.2 ok rtt=10ms`、`mtype ::/PERSIST.TXT => hello-v4` + Boot #2 冷重启 `[wmos] fs cat disk/persist.txt ok`，产出 `wmos-images` `3583263` B 与 `wmos-ci-logs-and-preview` `19051` B）。
 
 ---
 

@@ -68,7 +68,7 @@ flowchart TD
 | [rust-toolchain.toml](../rust-toolchain.toml) | 锁定 Rust `stable` 工具链与 `x86_64-unknown-none` 目标 |
 | [.gitignore](../.gitignore) | 忽略 `/kernel/target/`、`/dist/`、`/limine/`、`/iso_root/` 及镜像产物 |
 | [.gitattributes](../.gitattributes) | 强制 `*.sh` 脚本在 Git 检出/提交时保持 LF (`\n`) |
-| [.github/workflows/build.yml](../.github/workflows/build.yml) | GitHub Actions 自动编译、打包、QEMU 双模式验证与产物上传 |
+| [.github/workflows/build.yml](../.github/workflows/build.yml) | GitHub Actions 自动编译、打包、QEMU 双模式验证、产物上传与 `v*` 标签 Release 自动发布 |
 | [boot/limine.conf](../boot/limine.conf) | Limine v10 引导配置（`timeout: 1`，`protocol: limine`，`boot():/boot/wmos-kernel`） |
 | [docs/DESIGN.md](DESIGN.md) | 系统架构与核心子系统设计文档（本文档） |
 | [docs/CHANGELOG.md](CHANGELOG.md) | 版本里程碑与变更追踪日志 |
@@ -335,7 +335,9 @@ COM1（端口 `0x3F8`，[kernel/src/arch/serial.rs](../kernel/src/arch/serial.rs
 
 ## 6. 构建、多格式镜像与云端 QEMU 校验体系
 
-- **CI 工作流（[.github/workflows/build.yml](../.github/workflows/build.yml)）**：在 `ubuntu-latest` 上编译内核、打包镜像、运行 `./scripts/verify-qemu.sh` 并上传 `wmos-images` 与 `wmos-ci-logs-and-preview`。
+- **CI 与自动发布工作流（[.github/workflows/build.yml](../.github/workflows/build.yml)）**：
+  - 触发器涵盖 `push`（`branches: ["**"]` 与 `tags: ["v*"]`）、`pull_request` 及 `workflow_dispatch`，作业 `build-and-verify` 运行于 `ubuntu-latest` 并声明 `permissions: contents: write`。
+  - 在构建内核、打包镜像并完整通过 `./scripts/verify-qemu.sh` 验证后，分别上传 `wmos-images` 与 `wmos-ci-logs-and-preview` 两个 Actions 产物；当触发源为 `v*` 标签（`startsWith(github.ref, 'refs/tags/v')`）时，自动执行 `Publish GitHub Release`（`softprops/action-gh-release@v2`，启用 `generate_release_notes: true` 与 `fail_on_unmatched_files: true`），向 `WMOS ${{ github.ref_name }}` 发布 `dist/wmos.iso`、`dist/wmos.img`、`dist/wmos.qcow2`、`dist/wmos.vmdk`、`dist/wmos.vhd`、`dist/SHA256SUMS.txt` 与 `dist/boot-preview.png` 共 7 项 Release 资产。
 - **镜像打包（[scripts/build-images.sh](../scripts/build-images.sh)）**：先将 `user/hello.S` 静态汇编链接为 `dist/hello.elf` 并拷贝至 `iso_root/bin/hello.elf` 与 `::/bin/hello.elf`，随后生成 Hybrid BIOS+UEFI `dist/wmos.iso`、64 MiB GPT（`ef02` 分区 1 `2048:4095` + `ef00` FAT32 分区 2 `4096:+60M`）`dist/wmos.img`、`wmos.qcow2`、`wmos.vmdk`、`wmos.vhd` 与 `SHA256SUMS.txt`。
 - **QEMU 双模式、外部磁盘镜像、冷重启、网络与 Ring-3 校验（[scripts/verify-qemu.sh](../scripts/verify-qemu.sh)）**：
   - **`[1/3]` Legacy BIOS**：`dist/wmos.iso` 校验全部 18 项启动/初始化标记（含 `[wmos] syscall+ring3 ok`）且无 `PANIC`/`EXCEPTION`。
