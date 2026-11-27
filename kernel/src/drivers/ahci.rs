@@ -29,6 +29,8 @@ const PX_CI: u64 = 0x38;
 const SATA_SIG_ATA: u32 = 0x0000_0101;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
+const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 /// Metadata for the active AHCI SATA disk.
 #[derive(Clone, Copy)]
@@ -135,8 +137,8 @@ unsafe fn mmio_write(addr: u64, val: u32) {
 fn stop_port(port_base: u64) {
     unsafe {
         let mut cmd = mmio_read(port_base + PX_CMD);
-        cmd &= !(1 << 0); // Clear ST
-        cmd &= !(1 << 4); // Clear FRE
+        cmd &= !(1 << 0);
+        cmd &= !(1 << 4);
         mmio_write(port_base + PX_CMD, cmd);
 
         for _ in 0..500_000 {
@@ -177,15 +179,17 @@ fn wait_port_ready(port_base: u64) -> bool {
     false
 }
 
-fn issue_dma_read(
+fn issue_dma_cmd(
     port_base: u64,
     ctrl_phys: u64,
     dma_phys: u64,
     ata_cmd: u8,
     lba: u64,
     sectors: u16,
+    is_write: bool,
 ) -> Result<(), &'static str> {
-    if sectors == 0 || sectors > 8 {
+    let is_flush = ata_cmd == ATA_CMD_FLUSH_CACHE_EXT;
+    if !is_flush && (sectors == 0 || sectors > 8) {
         return Err("Invalid AHCI sector chunk count");
     }
 
@@ -195,17 +199,23 @@ fn issue_dma_read(
 
     let hhdm = vmm::hhdm_offset();
     let ctrl_virt = (ctrl_phys + hhdm) as *mut u8;
-    let byte_count = (sectors as u32) * 512;
 
     unsafe {
         mmio_write(port_base + PX_IS, 0xFFFF_FFFF);
+
+        let flags = if is_write && !is_flush {
+            5 | (1 << 6)
+        } else {
+            5
+        };
+        let prdtl = if is_flush { 0 } else { 1 };
 
         let cmd_hdr = ctrl_virt as *mut HbaCmdHeader;
         write_volatile(
             cmd_hdr,
             HbaCmdHeader {
-                flags: 5,
-                prdtl: 1,
+                flags,
+                prdtl,
                 prdbc: 0,
                 ctba: ((ctrl_phys + 0x800) & 0xFFFF_FFFF) as u32,
                 ctbau: ((ctrl_phys + 0x800) >> 32) as u32,
@@ -220,26 +230,31 @@ fn issue_dma_read(
         *cfis.add(0) = 0x27; // Host-to-Device Register FIS
         *cfis.add(1) = 0x80; // Command bit
         *cfis.add(2) = ata_cmd;
-        *cfis.add(4) = (lba & 0xFF) as u8;
-        *cfis.add(5) = ((lba >> 8) & 0xFF) as u8;
-        *cfis.add(6) = ((lba >> 16) & 0xFF) as u8;
-        *cfis.add(7) = if ata_cmd == ATA_CMD_IDENTIFY { 0x00 } else { 0x40 };
-        *cfis.add(8) = ((lba >> 24) & 0xFF) as u8;
-        *cfis.add(9) = ((lba >> 32) & 0xFF) as u8;
-        *cfis.add(10) = ((lba >> 40) & 0xFF) as u8;
-        *cfis.add(12) = (sectors & 0xFF) as u8;
-        *cfis.add(13) = ((sectors >> 8) & 0xFF) as u8;
+        if !is_flush {
+            *cfis.add(4) = (lba & 0xFF) as u8;
+            *cfis.add(5) = ((lba >> 8) & 0xFF) as u8;
+            *cfis.add(6) = ((lba >> 16) & 0xFF) as u8;
+            *cfis.add(7) = if ata_cmd == ATA_CMD_IDENTIFY { 0x00 } else { 0x40 };
+            *cfis.add(8) = ((lba >> 24) & 0xFF) as u8;
+            *cfis.add(9) = ((lba >> 32) & 0xFF) as u8;
+            *cfis.add(10) = ((lba >> 40) & 0xFF) as u8;
+            *cfis.add(12) = (sectors & 0xFF) as u8;
+            *cfis.add(13) = ((sectors >> 8) & 0xFF) as u8;
 
-        let prdt = ct_virt.add(0x80) as *mut HbaPrdtEntry;
-        write_volatile(
-            prdt,
-            HbaPrdtEntry {
-                dba: (dma_phys & 0xFFFF_FFFF) as u32,
-                dbau: (dma_phys >> 32) as u32,
-                reserved: 0,
-                dbc: (byte_count - 1) & 0x003F_FFFF,
-            },
-        );
+            let byte_count = (sectors as u32) * 512;
+            let prdt = ct_virt.add(0x80) as *mut HbaPrdtEntry;
+            write_volatile(
+                prdt,
+                HbaPrdtEntry {
+                    dba: (dma_phys & 0xFFFF_FFFF) as u32,
+                    dbau: (dma_phys >> 32) as u32,
+                    reserved: 0,
+                    dbc: (byte_count - 1) & 0x003F_FFFF,
+                },
+            );
+        } else {
+            *cfis.add(7) = 0x40;
+        }
 
         fence(Ordering::Release);
         mmio_write(port_base + PX_CI, 1);
@@ -275,7 +290,6 @@ pub fn init() -> Option<DiskInfo> {
         return None;
     }
 
-    // Enable PCI Memory Space (bit 1) and Bus Master DMA (bit 2)
     let cmd = pci::read_u32(dev.bus, dev.device, dev.function, 0x04);
     pci::write_u32(dev.bus, dev.device, dev.function, 0x04, cmd | 0x06);
 
@@ -342,7 +356,7 @@ pub fn init() -> Option<DiskInfo> {
 
     start_port(port_base);
 
-    if issue_dma_read(port_base, ctrl_phys, dma_phys, ATA_CMD_IDENTIFY, 0, 1).is_err() {
+    if issue_dma_cmd(port_base, ctrl_phys, dma_phys, ATA_CMD_IDENTIFY, 0, 1, false).is_err() {
         stop_port(port_base);
         pmm::free_frame(ctrl_phys);
         pmm::free_frame(dma_phys);
@@ -419,13 +433,14 @@ pub fn read_sectors(lba: u64, count: u16, buf: &mut [u8]) -> Result<(), &'static
 
     while remaining > 0 {
         let chunk = remaining.min(8);
-        issue_dma_read(
+        issue_dma_cmd(
             state.port_base,
             state.ctrl_phys,
             state.dma_phys,
             ATA_CMD_READ_DMA_EXT,
             cur_lba,
             chunk,
+            false,
         )?;
         let chunk_bytes = (chunk as usize) * 512;
         unsafe {
@@ -439,6 +454,65 @@ pub fn read_sectors(lba: u64, count: u16, buf: &mut [u8]) -> Result<(), &'static
         cur_lba += chunk as u64;
         offset += chunk_bytes;
     }
+
+    Ok(())
+}
+
+/// Writes `count` 512-byte sectors from `buf` starting at `lba` via AHCI DMA and flushes disk cache.
+pub fn write_sectors(lba: u64, count: u16, buf: &[u8]) -> Result<(), &'static str> {
+    let needed = (count as usize) * 512;
+    if buf.len() < needed {
+        return Err("Source buffer smaller than requested sector write");
+    }
+    if count == 0 {
+        return Ok(());
+    }
+
+    let mut guard = IrqGuard::acquire(&AHCI);
+    let state = guard.inner_mut().as_ref().ok_or("No AHCI disk active")?;
+
+    if lba.saturating_add(count as u64) > state.info.sectors {
+        return Err("Sector write beyond disk capacity");
+    }
+
+    let hhdm = vmm::hhdm_offset();
+    let mut remaining = count;
+    let mut cur_lba = lba;
+    let mut offset = 0usize;
+
+    while remaining > 0 {
+        let chunk = remaining.min(8);
+        let chunk_bytes = (chunk as usize) * 512;
+        unsafe {
+            copy_nonoverlapping(
+                buf.as_ptr().add(offset),
+                (state.dma_phys + hhdm) as *mut u8,
+                chunk_bytes,
+            );
+        }
+        issue_dma_cmd(
+            state.port_base,
+            state.ctrl_phys,
+            state.dma_phys,
+            ATA_CMD_WRITE_DMA_EXT,
+            cur_lba,
+            chunk,
+            true,
+        )?;
+        remaining -= chunk;
+        cur_lba += chunk as u64;
+        offset += chunk_bytes;
+    }
+
+    issue_dma_cmd(
+        state.port_base,
+        state.ctrl_phys,
+        state.dma_phys,
+        ATA_CMD_FLUSH_CACHE_EXT,
+        0,
+        0,
+        false,
+    )?;
 
     Ok(())
 }

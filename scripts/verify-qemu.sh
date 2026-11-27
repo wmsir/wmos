@@ -10,7 +10,7 @@ if [[ ! -f "dist/wmos.iso" || ! -f "dist/wmos.img" ]]; then
     exit 1
 fi
 
-rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock
+rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/qemu-uefi-reboot.log dist/wmos-persist-test.img dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock
 
 echo "=== [1/2] Verifying dist/wmos.iso in QEMU Legacy BIOS mode ==="
 set +e
@@ -34,7 +34,7 @@ if [[ ${bios_rc} -ne 0 && ${bios_rc} -ne 124 ]]; then
     exit 1
 fi
 
-echo "=== [2/2] Verifying dist/wmos.iso in QEMU UEFI (OVMF) mode ==="
+echo "=== [2/3] Verifying dist/wmos.iso + FAT32 disk write in QEMU UEFI (OVMF) Boot #1 ==="
 OVMF_CANDIDATES=(
     "/usr/share/OVMF/OVMF_CODE_4M.fd"
     "/usr/share/OVMF/OVMF_CODE.fd"
@@ -56,22 +56,29 @@ if [[ -z "${OVMF_CODE}" ]]; then
 fi
 echo "Using OVMF firmware: ${OVMF_CODE}"
 
+cp dist/wmos.img dist/wmos-persist-test.img
+
 QEMU_PID=""
-cleanup_uefi() {
+stop_qemu() {
     if [[ -n "${QEMU_PID}" ]] && kill -0 "${QEMU_PID}" 2>/dev/null; then
         kill "${QEMU_PID}" 2>/dev/null || true
         wait "${QEMU_PID}" 2>/dev/null || true
     fi
+    QEMU_PID=""
     rm -f /tmp/wmos-mon.sock
 }
-trap cleanup_uefi EXIT
+cleanup_all() {
+    stop_qemu
+    rm -f dist/wmos-persist-test.img
+}
+trap cleanup_all EXIT
 
 qemu-system-x86_64 \
     -M q35 \
     -m 256M \
     -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
     -cdrom dist/wmos.iso \
-    -drive "file=dist/wmos.img,format=raw" \
+    -drive "file=dist/wmos-persist-test.img,format=raw" \
     -vga std \
     -display none \
     -serial file:dist/qemu-uefi.log \
@@ -157,6 +164,7 @@ if os.path.exists(sock_path):
             "cat /disk/boot/limine/limine.conf",
             "write demo.txt hello",
             "cat demo.txt",
+            "write /disk/persist.txt hello-v4",
             "open files",
         ):
             send_command(s, cmd)
@@ -165,7 +173,11 @@ if os.path.exists(sock_path):
         while time.monotonic() < deadline:
             if os.path.exists(uefi_log_path):
                 with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
-                    if "[wmos] cmd: open files" in lf.read():
+                    content = lf.read()
+                    if (
+                        "[wmos] fs disk write disk/persist.txt ok" in content
+                        and "[wmos] cmd: open files" in content
+                    ):
                         break
             time.sleep(0.1)
 
@@ -174,9 +186,7 @@ if os.path.exists(sock_path):
 PY
 fi
 
-cleanup_uefi
-QEMU_PID=""
-trap - EXIT
+stop_qemu
 
 if [[ -f dist/boot-preview.ppm ]]; then
     python3 - <<'PY' || true
@@ -318,6 +328,8 @@ for uefi_marker in \
     "[wmos] fs cat disk/boot/limine/limine.conf ok" \
     "[wmos] cmd: write demo.txt hello" \
     "[wmos] fs cat demo.txt ok" \
+    "[wmos] cmd: write /disk/persist.txt hello-v4" \
+    "[wmos] fs disk write disk/persist.txt ok" \
     "[wmos] cmd: open files"
 do
     if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
@@ -326,9 +338,119 @@ do
     fi
 done
 
+echo "=== Verifying FAT32 disk image contents with mtools ==="
+mtype_out="$(mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT 2>/dev/null || mtype -i dist/wmos-persist-test.img@@2M ::/persist.txt)"
+echo "mtype ::/PERSIST.TXT => ${mtype_out}"
+if ! echo "${mtype_out}" | grep -qF "hello-v4"; then
+    echo "ERROR: mtype verification failed; 'hello-v4' not found in ::/PERSIST.TXT" >&2
+    exit 1
+fi
+
+echo "=== [3/3] Verifying cold reboot persistence in QEMU UEFI (OVMF) Boot #2 ==="
+qemu-system-x86_64 \
+    -M q35 \
+    -m 256M \
+    -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
+    -cdrom dist/wmos.iso \
+    -drive "file=dist/wmos-persist-test.img,format=raw" \
+    -vga std \
+    -display none \
+    -serial file:dist/qemu-uefi-reboot.log \
+    -monitor unix:/tmp/wmos-mon.sock,server,nowait \
+    -no-reboot \
+    -no-shutdown &
+QEMU_PID=$!
+
+reboot_ready=0
+for _ in $(seq 1 60); do
+    if [[ -f dist/qemu-uefi-reboot.log ]] && grep -qF "[wmos] ready" dist/qemu-uefi-reboot.log; then
+        reboot_ready=1
+        break
+    fi
+    if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.25
+done
+
+if [[ ${reboot_ready} -eq 1 ]]; then
+    sleep 0.3
+    python3 - <<'PY' || true
+import os
+import socket
+import time
+
+sock_path = "/tmp/wmos-mon.sock"
+reboot_log_path = "dist/qemu-uefi-reboot.log"
+
+def recv_until_prompt(sock: socket.socket, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    buf = b""
+    while time.monotonic() < deadline:
+        try:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"(qemu)" in buf:
+                break
+        except OSError:
+            break
+
+def send_mon(sock: socket.socket, cmd: bytes) -> None:
+    sock.sendall(cmd + b"\n")
+    recv_until_prompt(sock, timeout=2.0)
+
+def map_key(ch: str) -> bytes:
+    if "a" <= ch <= "z" or "0" <= ch <= "9":
+        return ch.encode("ascii")
+    if ch == " ":
+        return b"spc"
+    if ch == ".":
+        return b"dot"
+    if ch == "/":
+        return b"slash"
+    if ch == "-":
+        return b"minus"
+    raise ValueError(f"Unsupported key character: {ch!r}")
+
+if os.path.exists(sock_path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2.0)
+        s.connect(sock_path)
+        time.sleep(0.2)
+        recv_until_prompt(s, timeout=1.0)
+
+        for ch in "cat /disk/persist.txt":
+            send_mon(s, b"sendkey " + map_key(ch))
+            time.sleep(0.07)
+        send_mon(s, b"sendkey ret")
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            if os.path.exists(reboot_log_path):
+                with open(reboot_log_path, "r", encoding="utf-8", errors="replace") as lf:
+                    if "[wmos] fs cat disk/persist.txt ok" in lf.read():
+                        break
+            time.sleep(0.1)
+PY
+fi
+
+stop_qemu
+rm -f dist/wmos-persist-test.img
+trap - EXIT
+
+assert_log "dist/qemu-uefi-reboot.log" "UEFI-Reboot"
+if ! grep -qF "[wmos] fs cat disk/persist.txt ok" "dist/qemu-uefi-reboot.log"; then
+    echo "ERROR: Cold reboot log missing '[wmos] fs cat disk/persist.txt ok'" >&2
+    exit 1
+fi
+
 echo "=== Verification Summary ==="
-echo "BIOS log: PASSED (all required markers present, no PANIC/EXCEPTION)"
-echo "UEFI log: PASSED (all required + interactive markers present, no PANIC/EXCEPTION)"
+echo "BIOS log: PASSED (all 17 required markers present, no PANIC/EXCEPTION)"
+echo "UEFI Boot #1 log: PASSED (all 17 + interactive + FAT32 disk write markers present)"
+echo "mtools check: PASSED (::/PERSIST.TXT contains 'hello-v4')"
+echo "UEFI Boot #2 (cold reboot): PASSED ('[wmos] fs cat disk/persist.txt ok', no PANIC/EXCEPTION)"
 if [[ -f dist/boot-preview.png ]]; then
     echo "Preview PNG: dist/boot-preview.png generated"
 else

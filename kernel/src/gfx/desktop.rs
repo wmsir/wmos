@@ -929,7 +929,7 @@ fn render_desktop_header(fb: &mut Framebuffer, w: usize, work_h: usize) {
         fb.draw_str(
             24,
             14,
-            "WMOS v3.0.0 // x86_64 PCI + AHCI FAT32 + Multitask Desktop",
+            "WMOS v4.0.0 // x86_64 PCI + AHCI FAT32 RW + Multitask Desktop",
             color::TEXT_MUTED,
             None,
         );
@@ -1095,7 +1095,7 @@ fn render_system_info_content(
         y,
         max_w,
         max_y,
-        "OS      : wmos v3.0.0 (x86_64 no_std)",
+        "OS      : wmos v4.0.0 (x86_64 no_std)",
         color::TEXT_PRIMARY,
     );
     y += line_step;

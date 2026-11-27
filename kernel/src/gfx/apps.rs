@@ -23,6 +23,18 @@ const SWATCH_COLORS: [Color; 6] = [
     color::ACCENT,
 ];
 
+fn is_disk_readonly_path(name: &str) -> bool {
+    let norm = name.trim().trim_start_matches('/');
+    if norm == "disk" {
+        return true;
+    }
+    if let Some(rest) = norm.strip_prefix("disk/") {
+        rest.is_empty() || rest.contains('/')
+    } else {
+        false
+    }
+}
+
 pub struct PaintApp {
     canvas: Vec<Color>,
     active_swatch: usize,
@@ -238,7 +250,7 @@ impl NotepadApp {
     pub fn open_file(&mut self, name: &str) {
         let clean = name.trim().trim_start_matches('/');
         self.filename = String::from(clean);
-        self.read_only = clean.starts_with("disk/");
+        self.read_only = is_disk_readonly_path(clean);
         self.text = fs::read_to_string(clean).unwrap_or_default();
         self.status = if self.read_only { "ReadOnly" } else { "Loaded" };
     }
@@ -304,13 +316,19 @@ impl NotepadApp {
                 self.status = "ReadOnly";
                 return true;
             }
-            let _ = fs::write(self.filename.as_str(), self.text.as_bytes());
-            crate::serial_println!(
-                "[wmos] notepad saved {} ({} B)",
-                self.filename,
-                self.text.len()
-            );
-            self.status = "Saved";
+            match fs::write(self.filename.as_str(), self.text.as_bytes()) {
+                Ok(_) => {
+                    crate::serial_println!(
+                        "[wmos] notepad saved {} ({} B)",
+                        self.filename,
+                        self.text.len()
+                    );
+                    self.status = "Saved";
+                }
+                Err(_) => {
+                    self.status = "Error";
+                }
+            }
             return true;
         }
         if mx >= clear_x && mx < clear_x + 50 {
@@ -511,13 +529,19 @@ impl FilesApp {
             if mx >= ox + 104 && mx < ox + 144 {
                 if let Some(idx) = self.selected {
                     if let Some((name, is_disk, _)) = self.entries.get(idx).cloned() {
-                        if is_disk {
-                            self.status = "Read-only";
+                        if is_disk && is_disk_readonly_path(name.as_str()) {
+                            self.status = "Protected";
                             return (true, None);
                         }
-                        let _ = fs::remove(name.as_str());
-                        self.refresh();
-                        self.status = "Deleted";
+                        match fs::remove(name.as_str()) {
+                            Ok(()) => {
+                                self.refresh();
+                                self.status = "Deleted";
+                            }
+                            Err(_) => {
+                                self.status = "Protected";
+                            }
+                        }
                         return (true, None);
                     }
                 }
@@ -539,7 +563,15 @@ impl FilesApp {
             let idx = self.scroll + row;
             if idx < self.entries.len() {
                 self.selected = Some(idx);
-                self.status = if self.entries[idx].1 { "FAT32" } else { "RAMFS" };
+                self.status = if self.entries[idx].1 {
+                    if is_disk_readonly_path(self.entries[idx].0.as_str()) {
+                        "Protected"
+                    } else {
+                        "FAT32 RW"
+                    }
+                } else {
+                    "RAMFS"
+                };
                 return (true, None);
             }
         }
@@ -570,7 +602,7 @@ impl FilesApp {
         let badge = format!("{} | {}", self.entries.len(), self.status);
         let bw = badge.len() * 8;
         if cw > 224 + bw {
-            let bcol = if self.status == "Read-only" {
+            let bcol = if self.status == "Read-only" || self.status == "Protected" {
                 color::TERM_AMBER
             } else {
                 color::TERM_CYAN

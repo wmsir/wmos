@@ -1,6 +1,6 @@
 # WMOS 变更日志 (CHANGELOG)
 
-记录 WMOS 从初始引导原型到 `v3.0.0` 及后续演进的全部里程碑与代码级变更。
+记录 WMOS 从初始引导原型到 `v4.0.0` 及后续演进的全部里程碑与代码级变更。
 
 ---
 
@@ -18,7 +18,27 @@
 
 ---
 
+## [v4.0.0] - 2026-11-27
+
+- **变更类型**：`feat` / `ci` / `docs`
+- **改动文件**：
+  - AHCI 写盘与 FAT32 持久化：`kernel/src/drivers/ahci.rs`、`kernel/src/fs/fat32.rs`、`kernel/src/fs/mod.rs`
+  - 图形应用、桌面与终端：`kernel/src/gfx/apps.rs`、`kernel/src/gfx/desktop.rs`、`kernel/src/shell.rs`
+  - 持久化校验与文档：`scripts/verify-qemu.sh`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
+- **变更摘要**：
+  - **AHCI DMA 写扇区与缓存刷盘 (`drivers/ahci.rs`)**：`issue_dma_cmd` 支持写方向位 `flags = 5 | (1 << 6)` 与零 PRDT 刷盘命令；新增 `write_sectors(lba, count, buf)`（最大 8 扇区 / 4 KiB 分片经 `(dma_phys + hhdm)` 发送 `ATA_CMD_WRITE_DMA_EXT (0x35)`，末尾下发 `ATA_CMD_FLUSH_CACHE_EXT (0xEA)` 确保落盘）。
+  - **FAT32 根目录 8.3 读写与簇链管理 (`fs/fat32.rs` & `fs/mod.rs`)**：`Fat32Volume` 记录 `num_fats`、`sectors_per_fat`、`root_cluster`、`total_clusters`；新增 `encode_short_name`、`set_fat_entry`（多 FAT 镜像同步）、`alloc_chain`、`free_chain`、`scan_root_dir`、`write_root_file`（支持空槽复用与目录簇扩容）与 `delete_root_file`（标记 `0xE5` 并释放簇链）。`split_disk_root` 限定仅根目录 `/disk/<8.3>` 可写可删，子目录（`/disk/boot`、`/disk/EFI`）继续受保护；读取增加大小写不敏感匹配兜底；新增串口标记 `[wmos] fs disk write <norm> ok (<B> B)` 与 `[wmos] fs disk rm <norm> ok`。
+  - **GUI 与 Shell 可写 `/disk/` 集成 (`gfx/{apps,desktop}.rs` & `shell.rs`)**：`NotepadApp` 通过 `is_disk_readonly_path` 放行根目录 `/disk/<8.3>` 保存且在写入失败时显示 `Error`；`FilesApp` 支持删除根目录 `/disk/<8.3>` 磁盘文件并显示 `FAT32 RW` / `Protected` / `RAMFS` 状态；桌面顶栏、`System Info` 与终端 `help`/`info`/`about` 升级至 `wmos v4.0.0`，支持 `write`/`append`/`touch`/`rm` 操作 `/disk/<8.3>`。
+  - **CI 持久化与冷重启闭环验证 (`scripts/verify-qemu.sh`)**：UEFI Boot #1 挂载副本镜像 `dist/wmos-persist-test.img` 注入 `write /disk/persist.txt hello-v4`；宿主 `mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT` 验证 `hello-v4` 落盘；UEFI Boot #2 冷重启挂载同一镜像注入 `cat /disk/persist.txt` 并断言 `[wmos] fs cat disk/persist.txt ok`。
+- **验证结果**：
+  - 本地 `cargo build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `369304` B），`scripts/*.sh` 纯 LF（0 `\r` 字节）与零禁用标记检查通过。
+  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端 BIOS/UEFI + 持久化冷重启验证。
+
+---
+
 ## [v3.0.0] - 2026-11-27
+
+### `c592cb9` — PCI 枚举、AHCI SATA DMA、FAT32 `/disk/` 挂载、3 任务调度与多主题桌面
 
 - **变更类型**：`feat` / `ci` / `docs`
 - **改动文件**：

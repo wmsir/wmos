@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::cpu;
 use crate::fs::fat32::Fat32Volume;
 
-/// Metadata for a file stored in RAMFS or the read-only FAT32 disk mount.
+/// Metadata for a file stored in RAMFS or the FAT32 disk mount.
 pub struct FileEntry {
     pub name: String,
     pub size: usize,
@@ -91,6 +91,16 @@ fn is_disk_path(norm: &str) -> bool {
     norm == "disk" || norm.starts_with("disk/")
 }
 
+fn split_disk_root(norm: &str) -> Result<&str, &'static str> {
+    let Some(rest) = norm.strip_prefix("disk/") else {
+        return Err("Protected disk subdirectory (root /disk/<8.3> only)");
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return Err("Protected disk subdirectory (root /disk/<8.3> only)");
+    }
+    Ok(rest)
+}
+
 /// Initializes the RAMFS and seeds default files (`readme.txt`, `motd.txt`, `notes.txt`).
 pub fn init() {
     let mut guard = IrqGuard::acquire(&RAMFS);
@@ -100,23 +110,23 @@ pub fn init() {
     map.insert(
         String::from("readme.txt"),
         Vec::from(
-            &b"WMOS v3.0.0 In-Memory RAMFS + FAT32 Disk\n\
+            &b"WMOS v4.0.0 In-Memory RAMFS + Writable FAT32 Disk\n\
                Commands: ls, cat, write, append, touch, rm, stat, disks, lspci, ps, open <app>\n\
-               Apps: info, term, paint, notepad, files\n"[..],
+               Root /disk/<8.3> files persist across reboots; /disk/boot and /disk/EFI are protected.\n"[..],
         ),
     );
     map.insert(
         String::from("motd.txt"),
         Vec::from(
-            &b"Welcome to WMOS v3.0.0 (x86_64 Rust no_std Micro-OS)!\n\
-               PCI, AHCI SATA, FAT32 /disk/, Cooperative Scheduler, Heap, RTC, and RAMFS are online.\n"[..],
+            &b"Welcome to WMOS v4.0.0 (x86_64 Rust no_std Micro-OS)!\n\
+               AHCI DMA write, writable FAT32 /disk/, PCI, Scheduler, Heap, RTC, and RAMFS are online.\n"[..],
         ),
     );
     map.insert(
         String::from("notes.txt"),
         Vec::from(
             &b"WMOS Notepad\n\
-               Edit this text and click [Save] to store it in RAMFS.\n"[..],
+               Edit this text and click [Save] to store it in RAMFS or /disk/<8.3>.\n"[..],
         ),
     );
 }
@@ -136,7 +146,7 @@ pub fn is_disk_mounted() -> bool {
     guard.inner_mut().is_some()
 }
 
-/// Returns all mounted read-only FAT32 files prefixed with `disk/`.
+/// Returns all mounted FAT32 files prefixed with `disk/`.
 pub fn list_disk() -> Vec<FileEntry> {
     let mut guard = IrqGuard::acquire(&DISKFS);
     match guard.inner_mut() {
@@ -170,7 +180,11 @@ pub fn read(name: &str) -> Option<Vec<u8>> {
     if norm.starts_with("disk/") {
         let mut guard = IrqGuard::acquire(&DISKFS);
         let vol = guard.inner_mut().as_ref()?;
-        let rec = vol.files.iter().find(|f| f.path == norm)?;
+        let rec = vol
+            .files
+            .iter()
+            .find(|f| f.path == norm)
+            .or_else(|| vol.files.iter().find(|f| f.path.eq_ignore_ascii_case(&norm)))?;
         return fat32::read_file(vol, rec);
     }
 
@@ -188,24 +202,48 @@ pub fn read_to_string(name: &str) -> Option<String> {
     })
 }
 
-/// Writes `data` to `name` in RAMFS (rejecting read-only `disk/` paths).
+/// Writes `data` to `name` in RAMFS or root `/disk/<8.3>` FAT32 storage.
 pub fn write(name: &str, data: &[u8]) -> Result<usize, &'static str> {
     let norm = normalize_name(name)?;
     if is_disk_path(&norm) {
-        return Err("Disk mount is read-only");
+        let rest = split_disk_root(&norm)?;
+        let written = {
+            let mut guard = IrqGuard::acquire(&DISKFS);
+            let vol = guard.inner_mut().as_mut().ok_or("No FAT32 disk mounted")?;
+            fat32::write_root_file(vol, rest, data)?
+        };
+        crate::serial_println!("[wmos] fs disk write {} ok ({} B)", norm, written);
+        return Ok(written);
     }
+
     let mut guard = IrqGuard::acquire(&RAMFS);
     let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.insert(norm, data.to_vec());
     Ok(data.len())
 }
 
-/// Appends `data` to `name` in RAMFS (rejecting read-only `disk/` paths).
+/// Appends `data` to `name` in RAMFS or root `/disk/<8.3>` FAT32 storage.
 pub fn append(name: &str, data: &[u8]) -> Result<usize, &'static str> {
     let norm = normalize_name(name)?;
     if is_disk_path(&norm) {
-        return Err("Disk mount is read-only");
+        let rest = split_disk_root(&norm)?;
+        let total = {
+            let mut guard = IrqGuard::acquire(&DISKFS);
+            let vol = guard.inner_mut().as_mut().ok_or("No FAT32 disk mounted")?;
+            let mut combined = vol
+                .files
+                .iter()
+                .find(|f| f.path == norm)
+                .or_else(|| vol.files.iter().find(|f| f.path.eq_ignore_ascii_case(&norm)))
+                .and_then(|rec| fat32::read_file(vol, rec))
+                .unwrap_or_default();
+            combined.extend_from_slice(data);
+            fat32::write_root_file(vol, rest, &combined)?
+        };
+        crate::serial_println!("[wmos] fs disk write {} ok ({} B)", norm, total);
+        return Ok(data.len());
     }
+
     let mut guard = IrqGuard::acquire(&RAMFS);
     let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     let buf = map.entry(norm).or_default();
@@ -213,24 +251,50 @@ pub fn append(name: &str, data: &[u8]) -> Result<usize, &'static str> {
     Ok(data.len())
 }
 
-/// Creates an empty file at `name` in RAMFS (rejecting read-only `disk/` paths).
+/// Creates an empty file at `name` in RAMFS or root `/disk/<8.3>` FAT32 storage if absent.
 pub fn touch(name: &str) -> Result<(), &'static str> {
     let norm = normalize_name(name)?;
     if is_disk_path(&norm) {
-        return Err("Disk mount is read-only");
+        let rest = split_disk_root(&norm)?;
+        let mut created = false;
+        {
+            let mut guard = IrqGuard::acquire(&DISKFS);
+            let vol = guard.inner_mut().as_mut().ok_or("No FAT32 disk mounted")?;
+            let exists = vol
+                .files
+                .iter()
+                .any(|f| f.path == norm || f.path.eq_ignore_ascii_case(&norm));
+            if !exists {
+                fat32::write_root_file(vol, rest, &[])?;
+                created = true;
+            }
+        }
+        if created {
+            crate::serial_println!("[wmos] fs disk write {} ok (0 B)", norm);
+        }
+        return Ok(());
     }
+
     let mut guard = IrqGuard::acquire(&RAMFS);
     let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     map.entry(norm).or_default();
     Ok(())
 }
 
-/// Removes `name` from RAMFS (rejecting read-only `disk/` paths).
+/// Removes `name` from RAMFS or root `/disk/<8.3>` FAT32 storage.
 pub fn remove(name: &str) -> Result<(), &'static str> {
     let norm = normalize_name(name)?;
     if is_disk_path(&norm) {
-        return Err("Disk mount is read-only");
+        let rest = split_disk_root(&norm)?;
+        {
+            let mut guard = IrqGuard::acquire(&DISKFS);
+            let vol = guard.inner_mut().as_mut().ok_or("No FAT32 disk mounted")?;
+            fat32::delete_root_file(vol, rest)?;
+        }
+        crate::serial_println!("[wmos] fs disk rm {} ok", norm);
+        return Ok(());
     }
+
     let mut guard = IrqGuard::acquire(&RAMFS);
     let map = guard.inner_mut().get_or_insert_with(BTreeMap::new);
     if map.remove(&norm).is_some() {

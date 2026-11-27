@@ -293,7 +293,7 @@ impl TerminalState {
                 color::TERM_CYAN,
             );
             self.push_line(
-                "FS  : ls [/disk], cat <f>, write <f> <t>, append <f> <t>, touch/rm/stat <f>",
+                "FS  : ls [/disk], cat/write/append/touch/rm/stat <f> (/disk/<8.3> RW)",
                 color::TERM_GREEN,
             );
             self.push_line(
@@ -302,7 +302,7 @@ impl TerminalState {
             );
         } else if cmd == "info" {
             self.push_line(
-                "OS: wmos v3.0.0 | Arch: x86_64 (Rust no_std)",
+                "OS: wmos v4.0.0 | Arch: x86_64 (Rust no_std)",
                 color::TEXT_PRIMARY,
             );
             self.push_line(
@@ -606,7 +606,7 @@ impl TerminalState {
             self.lines.clear();
         } else if cmd == "about" {
             self.push_line(
-                "wmos v3.0.0 - Minimal x86_64 Rust no_std OS",
+                "wmos v4.0.0 - Minimal x86_64 Rust no_std OS",
                 color::TERM_CYAN,
             );
             self.push_line(
