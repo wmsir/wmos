@@ -6,6 +6,16 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 
 ---
 
+## 文档与维护规范
+
+> **强制同步原则**：任何代码、配置、脚本或 CI 工作流变更，**必须在同一次提交中同步更新文档**，确保文档与实现 100% 一致。
+
+- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、高半核链接与 HHDM/PMM/VMM 内存布局、启动时序与串口契约、核心子系统设计、镜像构建及 QEMU 校验体系
+- **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — 版本里程碑与每次变更的代码级追踪记录
+- **[AGENTS.md](AGENTS.md)** — 强制文档同步规则、Rust Stable `#![no_std]` 内核约束与 `.sh` 纯 LF 行尾规范
+
+---
+
 ## 核心特性（`v1.0.0-mvp`）
 
 - **引导与架构初始化**：
@@ -40,10 +50,14 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 ├── .github/workflows/build.yml   # GitHub Actions 自动构建、打包、QEMU 双模式验证与产物上传
 ├── .gitattributes                # 强制 *.sh 脚本使用 LF 行尾
 ├── .gitignore                    # 忽略构建产物、Limine 缓存及临时镜像
+├── AGENTS.md                     # 仓库工程约束与文档同步维护规范
 ├── README.md                     # 项目说明与运行指南
 ├── rust-toolchain.toml           # 锁定 Rust stable + x86_64-unknown-none 目标
 ├── boot/
 │   └── limine.conf               # Limine v10 引导配置（指向 boot():/boot/wmos-kernel）
+├── docs/
+│   ├── DESIGN.md                 # 代码核验版系统设计与架构文档
+│   └── CHANGELOG.md              # 版本与变更追踪日志
 ├── scripts/
 │   ├── build-images.sh           # 生成 ISO / RAW / QCOW2 / VMDK / VHD 与 SHA256SUMS.txt
 │   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI 启动断言、键鼠交互注入与截图导出
