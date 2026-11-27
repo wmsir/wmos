@@ -1,9 +1,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod arch;
 mod boot_info;
 mod drivers;
+mod fs;
 mod gfx;
 mod mem;
 mod shell;
@@ -92,6 +95,31 @@ pub extern "C" fn kmain() -> ! {
     let vmm_ok = mem::vmm::self_test();
     assert!(vmm_ok, "VMM self-test failed");
     serial_println!("[wmos] vmm self-test ok");
+
+    let heap_bytes = mem::heap::init();
+    serial_println!("[wmos] heap ok size={} KiB", heap_bytes / 1024);
+    assert!(mem::heap::self_test(), "Heap self-test failed");
+    serial_println!("[wmos] heap self-test ok");
+
+    let rtc_now = arch::rtc::read();
+    serial_println!(
+        "[wmos] rtc ok {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        rtc_now.year,
+        rtc_now.month,
+        rtc_now.day,
+        rtc_now.hour,
+        rtc_now.minute,
+        rtc_now.second
+    );
+
+    fs::init();
+    assert!(fs::self_test(), "RAMFS self-test failed");
+    let fs_st = fs::stats();
+    serial_println!(
+        "[wmos] fs ok files={} bytes={}",
+        fs_st.file_count,
+        fs_st.total_bytes
+    );
 
     arch::pit::init();
     drivers::mouse::set_bounds(summary.fb.width, summary.fb.height);

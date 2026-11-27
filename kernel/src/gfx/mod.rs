@@ -1,3 +1,4 @@
+pub mod apps;
 pub mod color;
 pub mod desktop;
 pub mod fb;

@@ -119,6 +119,22 @@ def send_mon(sock: socket.socket, cmd: bytes) -> None:
     sock.sendall(cmd + b"\n")
     recv_until_prompt(sock, timeout=2.0)
 
+def map_key(ch: str) -> bytes:
+    if "a" <= ch <= "z" or "0" <= ch <= "9":
+        return ch.encode("ascii")
+    if ch == " ":
+        return b"spc"
+    if ch == ".":
+        return b"dot"
+    raise ValueError(f"Unsupported key character: {ch!r}")
+
+def send_command(sock: socket.socket, text: str) -> None:
+    for ch in text:
+        send_mon(sock, b"sendkey " + map_key(ch))
+        time.sleep(0.07)
+    send_mon(sock, b"sendkey ret")
+    time.sleep(0.07)
+
 if os.path.exists(sock_path):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(2.0)
@@ -129,19 +145,24 @@ if os.path.exists(sock_path):
         send_mon(s, b"mouse_move 40 25")
         time.sleep(0.08)
 
-        for key in (b"h", b"e", b"l", b"p", b"ret"):
-            send_mon(s, b"sendkey " + key)
-            time.sleep(0.08)
+        for cmd in (
+            "ls",
+            "write demo.txt hello",
+            "cat demo.txt",
+            "date",
+            "open paint",
+        ):
+            send_command(s, cmd)
 
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline:
             if os.path.exists(uefi_log_path):
                 with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
-                    if "[wmos] cmd: help" in lf.read():
+                    if "[wmos] cmd: open paint" in lf.read():
                         break
             time.sleep(0.1)
 
-        time.sleep(0.2)
+        time.sleep(0.25)
         send_mon(s, b"screendump dist/boot-preview.ppm")
 PY
 fi
@@ -255,8 +276,13 @@ assert_log() {
         "[wmos] idt+pic ok"
         "[wmos] pmm ok"
         "[wmos] vmm self-test ok"
+        "[wmos] heap ok"
+        "[wmos] heap self-test ok"
+        "[wmos] rtc ok"
+        "[wmos] fs ok"
         "[wmos] pit+ps2 ok"
         "[wmos] fb="
+        "[wmos] fb double-buffer ok"
         "[wmos] desktop rendered"
         "[wmos] ready"
     )
@@ -271,7 +297,15 @@ assert_log() {
 assert_log "dist/qemu-bios.log" "BIOS"
 assert_log "dist/qemu-uefi.log" "UEFI"
 
-for uefi_marker in "[wmos] mouse active" "[wmos] cmd: help"; do
+for uefi_marker in \
+    "[wmos] mouse active" \
+    "[wmos] cmd: ls" \
+    "[wmos] cmd: write demo.txt hello" \
+    "[wmos] cmd: cat demo.txt" \
+    "[wmos] fs cat demo.txt ok" \
+    "[wmos] cmd: date" \
+    "[wmos] cmd: open paint"
+do
     if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
         echo "ERROR: UEFI log missing interactive marker: ${uefi_marker}" >&2
         exit 1

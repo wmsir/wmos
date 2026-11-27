@@ -6,6 +6,13 @@ use crate::gfx::fb::Framebuffer;
 pub const TITLE_BAR_H: usize = 26;
 pub const BORDER_W: usize = 1;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WindowButton {
+    Close,
+    Minimize,
+    Reset,
+}
+
 /// Fixed-capacity stack string buffer for `no_std` formatting without heap allocation.
 pub struct StackBuf<const N: usize> {
     buf: [u8; N],
@@ -46,6 +53,7 @@ impl<const N: usize> fmt::Write for StackBuf<N> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Window {
     pub x: usize,
     pub y: usize,
@@ -103,7 +111,7 @@ impl Window {
         // Outer border
         fb.draw_rect_outline(self.x, self.y, self.w, self.h, BORDER_W, border_col);
 
-        // Three window control dots
+        // Three window control dots: Red (Close), Yellow (Minimize), Green (Reset)
         let dot_y = self.y + (TITLE_BAR_H.saturating_sub(8)) / 2;
         draw_dot(fb, self.x + 10, dot_y, color::DOT_RED);
         draw_dot(fb, self.x + 22, dot_y, color::DOT_YELLOW);
@@ -139,6 +147,22 @@ impl Window {
             && px < self.x.saturating_add(self.w)
             && py >= self.y
             && py < self.y.saturating_add(TITLE_BAR_H)
+    }
+
+    pub fn button_hit_test(&self, px: usize, py: usize) -> Option<WindowButton> {
+        let dot_y = self.y + (TITLE_BAR_H.saturating_sub(8)) / 2;
+        if py < dot_y.saturating_sub(1) || py >= dot_y + 9 {
+            return None;
+        }
+        if px >= self.x + 9 && px < self.x + 19 {
+            Some(WindowButton::Close)
+        } else if px >= self.x + 21 && px < self.x + 31 {
+            Some(WindowButton::Minimize)
+        } else if px >= self.x + 33 && px < self.x + 43 {
+            Some(WindowButton::Reset)
+        } else {
+            None
+        }
     }
 }
 

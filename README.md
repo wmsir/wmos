@@ -1,6 +1,6 @@
-# WMOS (`v1.0.0-mvp`) — x86_64 Rust Micro-OS
+# WMOS (`v2.0.0`) — x86_64 Rust Micro-OS
 
-基于 Rust (`#![no_std]`, 100% Stable) 与 Limine 引导协议构建的独立 x86_64 微内核桌面操作系统，已完成硬件中断、物理/虚拟内存管理、PS/2 键鼠交互、防残影窗口桌面以及无头 QEMU BIOS/UEFI 全自动 CI 打包与交互验证。
+基于 Rust (`#![no_std]`, 100% Stable, `alloc`) 与 Limine 引导协议构建的独立 x86_64 微内核桌面操作系统，集成了硬件中断、PMM/VMM/内核堆、CMOS RTC 时钟、内存文件系统 RAMFS、PS/2 键鼠交互、RAM 双缓冲窗口桌面（`System Info` / `WMOS Terminal` / `WMOS Paint` / `WMOS Notepad`）以及无头 QEMU BIOS/UEFI 全自动 CI 打包与交互验证。
 
 GitHub 仓库：`https://github.com/wmsir/wmos`
 
@@ -10,36 +10,34 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 
 > **强制同步原则**：任何代码、配置、脚本或 CI 工作流变更，**必须在同一次提交中同步更新文档**，确保文档与实现 100% 一致。
 
-- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、高半核链接与 HHDM/PMM/VMM 内存布局、启动时序与串口契约、核心子系统设计、镜像构建及 QEMU 校验体系
+- **[docs/DESIGN.md](docs/DESIGN.md)** — 完整系统架构、高半核链接与 HHDM/PMM/VMM/Heap 内存布局、启动时序与串口契约、核心子系统设计、镜像构建及 QEMU 校验体系
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — 版本里程碑与每次变更的代码级追踪记录
 - **[AGENTS.md](AGENTS.md)** — 强制文档同步规则、Rust Stable `#![no_std]` 内核约束与 `.sh` 纯 LF 行尾规范
 
 ---
 
-## 核心特性（`v1.0.0-mvp`）
+## 核心特性（`v2.0.0`）
 
 - **引导与架构初始化**：
   - Limine v10 高半核 ELF64 引导（`0xffffffff80000000`），解析 HHDM、物理内存映射与线性帧缓冲（Framebuffer）。
-  - **64 位 GDT / TSS**：配置内核代码/数据段与 16 字节 TSS 描述符，并为 Double Fault（`#DF`，向量 8）分配独立 16 KiB IST 栈。
-  - **IDT 与 8259 PIC**：256 项中断描述符表 + 汇编 `global_asm!` 入口桩，重映射主/从 8259 PIC（`0x20` / `0x28`），开启 IRQ0（PIT）、IRQ1（键盘）、IRQ2（级联）与 IRQ12（鼠标）。
-- **内存管理**：
-  - **PMM（物理页框分配器）**：基于 4 KiB 页帧位图（最大支持 4 GiB）管理可用物理内存，支持 `alloc_frame` / `free_frame` 与实时用量统计。
-  - **VMM（4 级页表虚拟内存）**：支持 `map_page` / `unmap_page` / `translate`，开机自动执行写入-校验-释放自检（`[wmos] vmm self-test ok`）。
-- **定时器与 PS/2 键鼠驱动**：
-  - **PIT 100 Hz 定时器**：提供全局 `ticks()` 与 `uptime_secs()` 计时源。
-  - **PS/2 键盘与鼠标**：8042 控制器初始化，支持 Set 1 美式键盘（大小写/Shift/CapsLock/方向键/功能键）与 3 字节 PS/2 鼠标数据包解码。
-- **图形桌面与交互终端**：
-  - **防残影光标层**：`CursorLayer` 在光标移动或局部重绘前先保存/恢复背景像素，避免光标拖影。
-  - **可拖拽窗口与任务栏切换**：支持 `System Info`（实时内存、VMM、运行时间、IRQ 与光标状态）和 `WMOS Terminal` 窗口拖拽、Z 序置顶及底部任务栏标签切换。
-  - **交互式 `WMOS Terminal`**：内置命令行解释器，支持以下命令：
-    - `help` — 查看内置命令列表
-    - `info` — 查看系统版本、架构、Limine 版本、显示分辨率与 HHDM 偏移
-    - `mem` — 查看 PMM 物理页框统计并实时运行 VMM 自检
-    - `uptime` — 查看 PIT 滴答数、运行时间及键盘/鼠标中断计数
-    - `echo <text>` — 回显指定文本
-    - `clear` — 清空终端输出缓冲区
-    - `about` — 查看 WMOS `v1.0.0-mvp` 简介
-    - `reboot` — 通过 PS/2 控制器触发系统重启
+  - **64 位 GDT / TSS**：配置内核代码/数据段与 16 字节 TSS 描述符，并为 Double Fault（`#DF`，向量 8）分配独立 16 KiB IST1 栈。
+  - **IDT 与 8259 PIC**：256 项中断描述符表 + 汇编 `global_asm!` 入口桩，重映射主/从 8259 PIC（`0x20` / `0x28`），开启 IRQ0（PIT 100 Hz）、IRQ1（键盘）、IRQ2（级联）与 IRQ12（鼠标）。
+  - **CMOS RTC 实时时钟**：通过 `0x70`/`0x71` 端口读取真实日期时间（含 UIP 等待、双读校验及 BCD/12h 解码）。
+- **内存管理与动态堆**：
+  - **PMM（物理页框分配器）**：128 KiB 4 KiB 页帧位图（最高 4 GiB）。
+  - **VMM（4 级页表虚拟内存）**：支持 `map_page` / `unmap_page` / `translate` 与开机写入自检（`[wmos] vmm self-test ok`）。
+  - **内核堆（`#[global_allocator]`）**：在 `0xFFFF_A000_0000_0000` 动态映射 `2 MiB .. 16 MiB`，采用地址有序合并式自由链表支持 `alloc`（`Box`/`Vec`/`String`/`BTreeMap`）。
+- **内存文件系统（RAMFS）**：
+  - 基于 `BTreeMap` 的内核态内存文件系统，开机预置 `readme.txt`、`motd.txt`、`notes.txt` 并执行读写删自检（`[wmos] fs ok`）。
+- **双缓冲桌面、内置应用与交互终端**：
+  - **RAM 双缓冲渲染**：32/24bpp 后备帧缓存配合 `present_rect` / `present_all` 局部刷新 MMIO 显存，叠加 `12x16` 防残影指针图层。
+  - **多窗口桌面与 Start 菜单**：支持 4 个窗口（`System Info`、`WMOS Terminal`、`WMOS Paint`、`WMOS Notepad`）拖拽、标题栏红/黄/绿三按钮（关闭/最小化/重置）、Start 菜单启动/重启、任务栏标签切换以及右下角实时 CMOS RTC 时钟与光标坐标托盘。
+  - **内置 GUI 应用**：
+    - `WMOS Paint`：360×220 画布、6 种色板、`[S]`/`[L]` 笔刷切换、`Clear` 与 Bresenham 连续绘制/右键擦除。
+    - `WMOS Notepad`：绑定 RAMFS `notes.txt`，支持键盘编辑与 `Load`/`Save`/`Clear` 工具栏操作。
+  - **升级版 `WMOS Terminal`**：支持 `Up`/`Down` 64 条命令历史、`Left`/`Right` 行内编辑与 `Tab` 自动补全，内置 17 条命令：
+    - 系统与信息：`help`、`info`、`mem`、`date`、`uptime`、`open <info|term|paint|notepad>`、`echo <text>`、`clear`、`about`、`reboot`
+    - RAMFS 文件操作：`ls`、`cat <file>`、`write <file> <text>`、`append <file> <text>`、`touch <file>`、`rm <file>`、`stat <file>`
 
 ---
 
@@ -60,20 +58,21 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
 │   └── CHANGELOG.md              # 版本与变更追踪日志
 ├── scripts/
 │   ├── build-images.sh           # 生成 ISO / RAW / QCOW2 / VMDK / VHD 与 SHA256SUMS.txt
-│   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI 启动断言、键鼠交互注入与截图导出
+│   └── verify-qemu.sh            # 无头 QEMU BIOS + UEFI 启动断言、键鼠与终端命令注入及截图导出
 └── kernel/
     ├── .cargo/config.toml        # x86_64-unknown-none 静态内核编译参数
     ├── Cargo.toml                # wmos-kernel crate 配置（依赖 limine 0.5）
     ├── build.rs                  # 传入 linker-x86_64.ld 链接脚本
     ├── linker-x86_64.ld          # 高半核 (0xffffffff80000000) ELF64 链接脚本
     └── src/
-        ├── main.rs               # 内核入口 kmain、系统初始化与低功耗中断事件循环
+        ├── main.rs               # extern crate alloc、kmain 初始化与低功耗中断事件循环
         ├── boot_info.rs          # BootSummary / FramebufferInfo 引导信息抽象
-        ├── shell.rs              # WMOS Terminal 命令行状态机与内置命令
-        ├── arch/                 # x86_64 架构支持（cpu、io、serial、gdt、pic、pit、idt）
-        ├── mem/                  # 内存管理（pmm 物理页框分配器、vmm 4 级页表）
+        ├── shell.rs              # WMOS Terminal（17 条命令、历史记录、Tab 补全）
+        ├── fs/                   # 内存文件系统 RAMFS（BTreeMap）
+        ├── arch/                 # x86_64 架构支持（cpu、io、serial、gdt、pic、pit、rtc、idt）
+        ├── mem/                  # 内存管理（pmm 位图、vmm 4 级页表、heap 全局分配器）
         ├── drivers/              # 设备驱动（ps2 控制器、keyboard、mouse）
-        └── gfx/                  # 字体、Framebuffer 画布、窗口/防残影光标 UI 与桌面管理器
+        └── gfx/                  # 字体、双缓冲 Framebuffer、Window/CursorLayer、Paint/Notepad 与桌面管理
 ```
 
 ---
@@ -94,8 +93,8 @@ GitHub 仓库：`https://github.com/wmsir/wmos`
      - `SHA256SUMS.txt` — 所有镜像的 SHA-256 校验值
    - **`wmos-ci-logs-and-preview`**：包含 CI 验证日志与实时截图：
      - `qemu-bios.log` — QEMU Legacy BIOS 串口启动日志
-     - `qemu-uefi.log` — QEMU UEFI (OVMF) 串口启动及键鼠交互日志
-     - `boot-preview.png` — UEFI 模式下注入鼠标移动与 `help` 命令后的实时桌面截图
+     - `qemu-uefi.log` — QEMU UEFI (OVMF) 串口启动、键鼠与终端命令交互日志
+     - `boot-preview.png` — UEFI 模式下自动执行 `ls`/`write`/`cat`/`date`/`open paint` 后的实时桌面截图
 
 ---
 

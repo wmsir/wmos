@@ -4,4 +4,5 @@ pub mod idt;
 pub mod io;
 pub mod pic;
 pub mod pit;
+pub mod rtc;
 pub mod serial;

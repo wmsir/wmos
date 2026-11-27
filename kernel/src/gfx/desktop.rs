@@ -1,24 +1,45 @@
 use core::fmt::Write;
 
-use crate::arch::pit;
+use crate::arch::{cpu, pit, rtc};
 use crate::boot_info::BootSummary;
 use crate::drivers::keyboard::{self, KeyEvent};
 use crate::drivers::mouse::{self, MouseState};
+use crate::fs;
+use crate::gfx::apps::{NotepadApp, PaintApp};
 use crate::gfx::color::{self, Color};
 use crate::gfx::fb::Framebuffer;
-use crate::gfx::ui::{draw_progress_bar, BORDER_W, CURSOR_H, CURSOR_W, CursorLayer, StackBuf, Window};
-use crate::mem::pmm;
-use crate::shell::TerminalState;
+use crate::gfx::ui::{
+    draw_progress_bar, BORDER_W, CURSOR_H, CURSOR_W, CursorLayer, StackBuf, Window, WindowButton,
+};
+use crate::mem::{heap, pmm};
+use crate::shell::{ShellAction, TerminalState};
 
 const TASKBAR_H: usize = 36;
 const MIB: u64 = 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
-const TAB1_X: usize = 80;
-const TAB1_W: usize = 116;
-const TAB2_X: usize = 204;
-const TAB2_W: usize = 132;
-const TRAY_W: usize = 208;
+const START_PILL_X: usize = 8;
+const START_PILL_W: usize = 64;
+const START_MENU_X: usize = 8;
+const START_MENU_W: usize = 176;
+const START_MENU_ITEM_H: usize = 28;
+const START_MENU_ITEMS: [&str; 5] = [
+    "System Info",
+    "WMOS Terminal",
+    "WMOS Paint",
+    "WMOS Notepad",
+    "Reboot System",
+];
+
+const WIN_COUNT: usize = 4;
+const TAB_LABELS: [&str; WIN_COUNT] = ["Info", "Term", "Paint", "Note"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowVis {
+    Open,
+    Minimized,
+    Closed,
+}
 
 #[derive(Clone, Copy)]
 struct DragState {
@@ -31,10 +52,15 @@ pub struct DesktopState {
     fb: Framebuffer,
     summary: BootSummary,
     vmm_ok: bool,
-    wins: [Window; 2],
-    z_order: [usize; 2],
+    wins: [Window; WIN_COUNT],
+    vis: [WindowVis; WIN_COUNT],
+    default_rects: [(usize, usize, usize, usize); WIN_COUNT],
+    z_order: [usize; WIN_COUNT],
     cursor: CursorLayer,
     terminal: TerminalState,
+    paint: PaintApp,
+    notepad: NotepadApp,
+    start_menu_open: bool,
     drag: Option<DragState>,
     prev_buttons: u8,
     mouse_logged: bool,
@@ -49,10 +75,16 @@ impl DesktopState {
         let h = fb.height();
         let work_h = h.saturating_sub(TASKBAR_H);
 
-        let (mut sys_win, mut term_win) = compute_window_layout(w, work_h);
-        sys_win.active = false;
-        term_win.active = true;
+        if fb.is_double_buffered() {
+            crate::serial_println!(
+                "[wmos] fb double-buffer ok ({}x{}, {} KiB)",
+                w,
+                h,
+                fb.backbuffer_bytes() / 1024
+            );
+        }
 
+        let (wins, default_rects) = compute_initial_windows(w, work_h);
         let init_mx = ((w * 56) / 100).min(w.saturating_sub(CURSOR_W));
         let init_my = ((work_h * 45) / 100).min(work_h.saturating_sub(CURSOR_H));
 
@@ -60,10 +92,20 @@ impl DesktopState {
             fb,
             summary,
             vmm_ok,
-            wins: [sys_win, term_win],
-            z_order: [0, 1],
+            wins,
+            vis: [
+                WindowVis::Open,
+                WindowVis::Open,
+                WindowVis::Closed,
+                WindowVis::Closed,
+            ],
+            default_rects,
+            z_order: [2, 3, 0, 1],
             cursor: CursorLayer::new(),
             terminal: TerminalState::new(&summary, vmm_ok),
+            paint: PaintApp::new(),
+            notepad: NotepadApp::new(),
+            start_menu_open: false,
             drag: None,
             prev_buttons: 0,
             mouse_logged: false,
@@ -72,11 +114,9 @@ impl DesktopState {
         };
 
         if !summary.fb.addr.is_null() && w > 0 && h > 0 {
-            desktop.fb.fill_gradient_v(0, 0, w, work_h, color::DESKTOP_TOP, color::DESKTOP_BOTTOM);
-            render_desktop_header(&mut desktop.fb, w, work_h);
-            desktop.redraw_windows();
-            desktop.redraw_taskbar();
+            desktop.redraw_scene_to_backbuffer();
             desktop.cursor.save_and_draw(&mut desktop.fb, init_mx, init_my);
+            desktop.fb.present_all();
         }
 
         desktop
@@ -89,23 +129,65 @@ impl DesktopState {
         let (mx, my) = self.cursor.position();
         self.cursor.restore(&mut self.fb);
 
-        let term_on_top = self.z_order[1] == 1 && self.wins[1].active;
-        self.terminal.handle_key(ev, &self.summary, self.vmm_ok);
-
-        if !term_on_top {
-            self.focus_window(1);
-            self.redraw_windows();
-            self.redraw_taskbar();
-        } else {
-            render_terminal_content(
-                &mut self.fb,
-                &self.wins[1],
-                &self.terminal,
-                self.last_cursor_blink,
-            );
+        if self.vis[3] == WindowVis::Open && self.wins[3].active {
+            if self.notepad.handle_key(ev) {
+                self.notepad
+                    .render(&mut self.fb, &self.wins[3], self.last_cursor_blink);
+                if self.start_menu_open {
+                    self.draw_start_menu();
+                }
+                self.cursor.save_and_draw(&mut self.fb, mx, my);
+                self.fb.present_rect(
+                    self.wins[3].x,
+                    self.wins[3].y,
+                    self.wins[3].w,
+                    self.wins[3].h,
+                );
+                self.fb.present_rect(mx, my, CURSOR_W, CURSOR_H);
+                return;
+            }
+            self.cursor.save_and_draw(&mut self.fb, mx, my);
+            return;
         }
 
-        self.cursor.save_and_draw(&mut self.fb, mx, my);
+        let need_open_or_focus = self.vis[1] != WindowVis::Open || !self.wins[1].active;
+        if need_open_or_focus {
+            self.open_and_focus(1);
+        }
+
+        let action = self.terminal.handle_key(ev, &self.summary, self.vmm_ok);
+        match action {
+            ShellAction::OpenApp(app_idx) if app_idx < WIN_COUNT => {
+                self.open_and_focus(app_idx);
+                self.redraw_scene_to_backbuffer();
+                self.cursor.save_and_draw(&mut self.fb, mx, my);
+                self.fb.present_all();
+            }
+            _ if need_open_or_focus => {
+                self.redraw_scene_to_backbuffer();
+                self.cursor.save_and_draw(&mut self.fb, mx, my);
+                self.fb.present_all();
+            }
+            _ => {
+                render_terminal_content(
+                    &mut self.fb,
+                    &self.wins[1],
+                    &self.terminal,
+                    self.last_cursor_blink,
+                );
+                if self.start_menu_open {
+                    self.draw_start_menu();
+                }
+                self.cursor.save_and_draw(&mut self.fb, mx, my);
+                self.fb.present_rect(
+                    self.wins[1].x,
+                    self.wins[1].y,
+                    self.wins[1].w,
+                    self.wins[1].h,
+                );
+                self.fb.present_rect(mx, my, CURSOR_W, CURSOR_H);
+            }
+        }
     }
 
     pub fn handle_mouse(&mut self, ms: MouseState) {
@@ -125,43 +207,86 @@ impl DesktopState {
         }
 
         let left = (ms.buttons & 1) != 0;
+        let right = (ms.buttons & 2) != 0;
         let prev_left = (self.prev_buttons & 1) != 0;
+        let prev_right = (self.prev_buttons & 2) != 0;
+        let left_just = left && !prev_left;
+        let right_just = right && !prev_right;
         self.prev_buttons = ms.buttons;
 
-        let mut need_redraw_all = false;
+        let (old_mx, old_my) = self.cursor.position();
+        let mut need_full_redraw = false;
+        let mut dirty_win: Option<usize> = None;
 
-        if left && !prev_left {
-            if my >= work_h {
-                let pill_y = work_h + 5;
-                let pill_h = 26;
-                if my >= pill_y && my < pill_y + pill_h {
-                    if mx >= TAB1_X && mx < TAB1_X + TAB1_W {
-                        need_redraw_all = self.focus_window(0);
-                    } else if mx >= TAB2_X && mx < TAB2_X + TAB2_W {
-                        need_redraw_all = self.focus_window(1);
+        if left_just {
+            let pill_y = work_h + 5;
+            let pill_h = 26;
+            if my >= work_h && my >= pill_y && my < pill_y + pill_h && mx >= START_PILL_X && mx < START_PILL_X + START_PILL_W {
+                self.start_menu_open = !self.start_menu_open;
+                need_full_redraw = true;
+            } else if self.start_menu_open {
+                if let Some(item_idx) = self.start_menu_hit(mx, my, work_h) {
+                    self.start_menu_open = false;
+                    if item_idx == 4 {
+                        crate::serial_println!("[wmos] reboot requested");
+                        cpu::reboot();
+                    } else if item_idx < WIN_COUNT {
+                        self.open_and_focus(item_idx);
                     }
-                }
-            } else {
-                let top_idx = self.z_order[1];
-                let bot_idx = self.z_order[0];
-                let hit_idx = if self.wins[top_idx].hit_test(mx, my) {
-                    Some(top_idx)
-                } else if self.wins[bot_idx].hit_test(mx, my) {
-                    Some(bot_idx)
                 } else {
-                    None
-                };
-
-                if let Some(idx) = hit_idx {
-                    if self.focus_window(idx) {
-                        need_redraw_all = true;
+                    self.start_menu_open = false;
+                }
+                need_full_redraw = true;
+            } else if my >= work_h {
+                if let Some(tab_idx) = self.taskbar_tab_hit(mx, my, w, work_h) {
+                    if self.vis[tab_idx] == WindowVis::Open && self.wins[tab_idx].active {
+                        self.minimize_window(tab_idx);
+                    } else {
+                        self.open_and_focus(tab_idx);
                     }
-                    if self.wins[idx].title_bar_hit_test(mx, my) {
-                        self.drag = Some(DragState {
-                            win_idx: idx,
-                            off_x: mx.saturating_sub(self.wins[idx].x),
-                            off_y: my.saturating_sub(self.wins[idx].y),
-                        });
+                    need_full_redraw = true;
+                }
+            } else if let Some(idx) = self.topmost_open_hit(mx, my) {
+                if self.wins[idx].title_bar_hit_test(mx, my) {
+                    match self.wins[idx].button_hit_test(mx, my) {
+                        Some(WindowButton::Close) => {
+                            self.close_window(idx);
+                            need_full_redraw = true;
+                        }
+                        Some(WindowButton::Minimize) => {
+                            self.minimize_window(idx);
+                            need_full_redraw = true;
+                        }
+                        Some(WindowButton::Reset) => {
+                            let (rx, ry, rw, rh) = self.default_rects[idx];
+                            self.wins[idx].x = rx;
+                            self.wins[idx].y = ry;
+                            self.wins[idx].w = rw;
+                            self.wins[idx].h = rh;
+                            self.open_and_focus(idx);
+                            need_full_redraw = true;
+                        }
+                        None => {
+                            if self.focus_window(idx) {
+                                need_full_redraw = true;
+                            }
+                            self.drag = Some(DragState {
+                                win_idx: idx,
+                                off_x: mx.saturating_sub(self.wins[idx].x),
+                                off_y: my.saturating_sub(self.wins[idx].y),
+                            });
+                        }
+                    }
+                } else {
+                    if self.focus_window(idx) {
+                        need_full_redraw = true;
+                    }
+                    if idx == 2 {
+                        if self.paint.handle_mouse(&self.wins[2], mx, my, true, right, true) {
+                            dirty_win = Some(2);
+                        }
+                    } else if idx == 3 && self.notepad.handle_mouse(&self.wins[3], mx, my, true) {
+                        dirty_win = Some(3);
                     }
                 }
             }
@@ -178,57 +303,90 @@ impl DesktopState {
                 let nx = mx.saturating_sub(drag.off_x).min(max_x);
                 let ny = my.saturating_sub(drag.off_y).min(max_y);
 
-                let old_x = self.wins[drag.win_idx].x;
-                let old_y = self.wins[drag.win_idx].y;
-
-                if nx != old_x || ny != old_y {
+                if nx != self.wins[drag.win_idx].x || ny != self.wins[drag.win_idx].y {
                     self.cursor.restore(&mut self.fb);
-
-                    let restore_w = win_w.saturating_add(4);
-                    let restore_h = win_h.saturating_add(4);
-                    self.fb.fill_gradient_v_region(
-                        old_x,
-                        old_y,
-                        restore_w,
-                        restore_h,
-                        work_h,
-                        color::DESKTOP_TOP,
-                        color::DESKTOP_BOTTOM,
-                    );
-                    if old_y < 28 {
-                        render_desktop_header(&mut self.fb, w, work_h);
-                    }
-
                     self.wins[drag.win_idx].x = nx;
                     self.wins[drag.win_idx].y = ny;
-
-                    self.redraw_windows();
-                    self.redraw_taskbar_tray((mx, my), pit::uptime_secs());
+                    self.redraw_scene_to_backbuffer();
                     self.cursor.save_and_draw(&mut self.fb, mx, my);
                     self.last_mouse_pos = (mx, my);
+                    self.fb.present_all();
                     return;
+                }
+            } else if !left_just && self.vis[2] == WindowVis::Open && self.wins[2].active {
+                if let Some(top_idx) = self.topmost_open_hit(mx, my) {
+                    if top_idx == 2
+                        && !self.wins[2].title_bar_hit_test(mx, my)
+                        && self.paint.handle_mouse(&self.wins[2], mx, my, true, right, false)
+                    {
+                        dirty_win = Some(2);
+                    }
+                }
+            }
+        } else if right && self.vis[2] == WindowVis::Open {
+            if let Some(top_idx) = self.topmost_open_hit(mx, my) {
+                if top_idx == 2 && !self.wins[2].title_bar_hit_test(mx, my) {
+                    if self.focus_window(2) {
+                        need_full_redraw = true;
+                    }
+                    if self
+                        .paint
+                        .handle_mouse(&self.wins[2], mx, my, false, true, right_just)
+                    {
+                        dirty_win = Some(2);
+                    }
                 }
             }
         }
 
         self.cursor.restore(&mut self.fb);
 
-        if need_redraw_all {
-            self.redraw_windows();
-            self.redraw_taskbar();
-            self.redraw_taskbar_tray((mx, my), pit::uptime_secs());
-        } else if (mx, my) != self.last_mouse_pos {
-            self.redraw_taskbar_tray((mx, my), pit::uptime_secs());
+        if need_full_redraw {
+            self.redraw_scene_to_backbuffer();
+            self.cursor.save_and_draw(&mut self.fb, mx, my);
+            self.last_mouse_pos = (mx, my);
+            self.fb.present_all();
+            return;
+        }
+
+        if let Some(idx) = dirty_win {
+            self.render_window_body(idx);
+            self.cursor.save_and_draw(&mut self.fb, mx, my);
+            self.last_mouse_pos = (mx, my);
+            self.fb.present_rect(
+                self.wins[idx].x,
+                self.wins[idx].y,
+                self.wins[idx].w,
+                self.wins[idx].h,
+            );
+            self.fb.present_rect(old_mx, old_my, CURSOR_W, CURSOR_H);
+            self.fb.present_rect(mx, my, CURSOR_W, CURSOR_H);
+            return;
+        }
+
+        if (mx, my) != self.last_mouse_pos {
+            self.redraw_taskbar_tray((mx, my));
         }
 
         self.cursor.save_and_draw(&mut self.fb, mx, my);
         self.last_mouse_pos = (mx, my);
+
+        self.fb.present_rect(old_mx, old_my, CURSOR_W, CURSOR_H);
+        self.fb.present_rect(mx, my, CURSOR_W, CURSOR_H);
+        if work_h + TASKBAR_H <= h {
+            let tray_w = tray_width_for(w);
+            let tray_x = w.saturating_sub(tray_w + 8);
+            self.fb.present_rect(tray_x, work_h + 5, w.saturating_sub(tray_x), 26);
+        }
     }
 
     pub fn handle_tick(&mut self, ticks: u64) {
         if self.summary.fb.addr.is_null() || self.fb.width() == 0 || self.fb.height() == 0 {
             return;
         }
+        let w = self.fb.width();
+        let h = self.fb.height();
+        let work_h = h.saturating_sub(TASKBAR_H);
         let (mx, my) = self.cursor.position();
         self.cursor.restore(&mut self.fb);
 
@@ -236,51 +394,17 @@ impl DesktopState {
         let blink_changed = blink != self.last_cursor_blink;
         self.last_cursor_blink = blink;
 
-        let overlap = rects_overlap(&self.wins[0], &self.wins[1]);
-        if overlap && self.z_order[1] != 0 {
-            // System Info is behind WMOS Terminal: redraw in z_order to preserve stacking
-            self.redraw_windows();
-        } else {
-            // Safe to refresh System Info client area in place without border flicker
-            let (ox, oy) = self.wins[0].client_origin();
-            let cw = self.wins[0].w.saturating_sub(BORDER_W * 2);
-            let ch = (self.wins[0].y + self.wins[0].h).saturating_sub(oy + BORDER_W);
-            self.fb.fill_rect(ox, oy, cw, ch, color::WIN_BG);
-            render_system_info_content(
-                &mut self.fb,
-                &self.wins[0],
-                &self.summary,
-                self.vmm_ok,
-                self.last_mouse_pos,
-                self.prev_buttons,
-            );
-
-            if blink_changed {
-                render_terminal_prompt_only(&mut self.fb, &self.wins[1], &self.terminal, blink);
-            }
-        }
-
-        self.redraw_taskbar_tray(self.last_mouse_pos, pit::uptime_secs());
-        self.cursor.save_and_draw(&mut self.fb, mx, my);
-    }
-
-    fn focus_window(&mut self, target: usize) -> bool {
-        let already_focused = self.z_order[1] == target && self.wins[target].active;
-        if already_focused {
-            return false;
-        }
-        let other = if target == 0 { 1 } else { 0 };
-        self.z_order = [other, target];
-        self.wins[target].active = true;
-        self.wins[other].active = false;
-        true
-    }
-
-    fn redraw_windows(&mut self) {
-        for i in 0..2 {
-            let idx = self.z_order[i];
-            self.wins[idx].draw(&mut self.fb);
-            if idx == 0 {
+        if self.vis[0] == WindowVis::Open {
+            if self.any_higher_overlap(0) {
+                self.redraw_scene_to_backbuffer();
+                self.cursor.save_and_draw(&mut self.fb, mx, my);
+                self.fb.present_all();
+                return;
+            } else {
+                let (ox, oy) = self.wins[0].client_origin();
+                let cw = self.wins[0].w.saturating_sub(BORDER_W * 2);
+                let ch = (self.wins[0].y + self.wins[0].h).saturating_sub(oy + BORDER_W);
+                self.fb.fill_rect(ox, oy, cw, ch, color::WIN_BG);
                 render_system_info_content(
                     &mut self.fb,
                     &self.wins[0],
@@ -289,15 +413,234 @@ impl DesktopState {
                     self.last_mouse_pos,
                     self.prev_buttons,
                 );
-            } else {
-                render_terminal_content(
-                    &mut self.fb,
-                    &self.wins[1],
-                    &self.terminal,
-                    self.last_cursor_blink,
+                if self.start_menu_open {
+                    self.draw_start_menu();
+                }
+                self.fb.present_rect(ox, oy, cw, ch);
+            }
+        }
+
+        if blink_changed {
+            if self.vis[1] == WindowVis::Open && !self.any_higher_overlap(1) {
+                render_terminal_prompt_only(&mut self.fb, &self.wins[1], &self.terminal, blink);
+                self.fb.present_rect(
+                    self.wins[1].x,
+                    self.wins[1].y,
+                    self.wins[1].w,
+                    self.wins[1].h,
+                );
+            }
+            if self.vis[3] == WindowVis::Open && self.wins[3].active && !self.any_higher_overlap(3)
+            {
+                self.notepad.render(&mut self.fb, &self.wins[3], blink);
+                self.fb.present_rect(
+                    self.wins[3].x,
+                    self.wins[3].y,
+                    self.wins[3].w,
+                    self.wins[3].h,
                 );
             }
         }
+
+        self.redraw_taskbar_tray(self.last_mouse_pos);
+        let tray_w = tray_width_for(w);
+        let tray_x = w.saturating_sub(tray_w + 8);
+        self.fb
+            .present_rect(tray_x, work_h + 5, w.saturating_sub(tray_x), 26);
+
+        self.cursor.save_and_draw(&mut self.fb, mx, my);
+        self.fb.present_rect(mx, my, CURSOR_W, CURSOR_H);
+    }
+
+    fn topmost_open_hit(&self, mx: usize, my: usize) -> Option<usize> {
+        for &idx in self.z_order.iter().rev() {
+            if self.vis[idx] == WindowVis::Open && self.wins[idx].hit_test(mx, my) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn any_higher_overlap(&self, target: usize) -> bool {
+        let Some(pos) = self.z_order.iter().position(|&id| id == target) else {
+            return false;
+        };
+        for &other in &self.z_order[pos + 1..] {
+            if self.vis[other] == WindowVis::Open && rects_overlap(&self.wins[target], &self.wins[other]) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn focus_window(&mut self, target: usize) -> bool {
+        if self.z_order[WIN_COUNT - 1] == target && self.wins[target].active {
+            return false;
+        }
+        let mut new_order = [0usize; WIN_COUNT];
+        let mut k = 0usize;
+        for &id in &self.z_order {
+            if id != target {
+                new_order[k] = id;
+                k += 1;
+            }
+            self.wins[id].active = false;
+        }
+        new_order[WIN_COUNT - 1] = target;
+        self.z_order = new_order;
+        self.wins[target].active = true;
+        true
+    }
+
+    fn open_and_focus(&mut self, target: usize) {
+        self.vis[target] = WindowVis::Open;
+        self.focus_window(target);
+    }
+
+    fn minimize_window(&mut self, target: usize) {
+        self.vis[target] = WindowVis::Minimized;
+        self.wins[target].active = false;
+        self.drag = None;
+        self.focus_next_open();
+    }
+
+    fn close_window(&mut self, target: usize) {
+        self.vis[target] = WindowVis::Closed;
+        self.wins[target].active = false;
+        self.drag = None;
+        self.focus_next_open();
+    }
+
+    fn focus_next_open(&mut self) {
+        for &id in self.z_order.iter().rev() {
+            if self.vis[id] == WindowVis::Open {
+                self.focus_window(id);
+                return;
+            }
+        }
+    }
+
+    fn redraw_scene_to_backbuffer(&mut self) {
+        let w = self.fb.width();
+        let h = self.fb.height();
+        let work_h = h.saturating_sub(TASKBAR_H);
+
+        self.fb
+            .fill_gradient_v(0, 0, w, work_h, color::DESKTOP_TOP, color::DESKTOP_BOTTOM);
+        render_desktop_header(&mut self.fb, w, work_h);
+
+        for i in 0..WIN_COUNT {
+            let idx = self.z_order[i];
+            if self.vis[idx] == WindowVis::Open {
+                self.wins[idx].draw(&mut self.fb);
+                self.render_window_body(idx);
+            }
+        }
+
+        self.redraw_taskbar();
+        if self.start_menu_open {
+            self.draw_start_menu();
+        }
+    }
+
+    fn render_window_body(&mut self, idx: usize) {
+        match idx {
+            0 => render_system_info_content(
+                &mut self.fb,
+                &self.wins[0],
+                &self.summary,
+                self.vmm_ok,
+                self.last_mouse_pos,
+                self.prev_buttons,
+            ),
+            1 => render_terminal_content(
+                &mut self.fb,
+                &self.wins[1],
+                &self.terminal,
+                self.last_cursor_blink,
+            ),
+            2 => self.paint.render(&mut self.fb, &self.wins[2]),
+            3 => self
+                .notepad
+                .render(&mut self.fb, &self.wins[3], self.last_cursor_blink),
+            _ => {}
+        }
+    }
+
+    fn start_menu_rect(&self, work_h: usize) -> (usize, usize, usize, usize) {
+        let mh = START_MENU_ITEMS.len() * START_MENU_ITEM_H + 8;
+        let my = work_h.saturating_sub(mh + 2);
+        (START_MENU_X, my, START_MENU_W, mh)
+    }
+
+    fn start_menu_hit(&self, mx: usize, my: usize, work_h: usize) -> Option<usize> {
+        let (sx, sy, sw, sh) = self.start_menu_rect(work_h);
+        if mx < sx || mx >= sx + sw || my < sy + 4 || my >= sy + sh - 4 {
+            return None;
+        }
+        let idx = (my - (sy + 4)) / START_MENU_ITEM_H;
+        if idx < START_MENU_ITEMS.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    fn draw_start_menu(&mut self) {
+        let work_h = self.fb.height().saturating_sub(TASKBAR_H);
+        let (sx, sy, sw, sh) = self.start_menu_rect(work_h);
+
+        self.fb
+            .fill_rect(sx + 4, sy + 4, sw, sh, color::WIN_SHADOW);
+        self.fb.fill_rect(sx, sy, sw, sh, color::WIN_BG);
+        self.fb
+            .draw_rect_outline(sx, sy, sw, sh, 1, color::WIN_BORDER_ACTIVE);
+
+        for (i, &label) in START_MENU_ITEMS.iter().enumerate() {
+            let iy = sy + 4 + i * START_MENU_ITEM_H;
+            if i == 4 {
+                self.fb
+                    .draw_hline(sx + 6, iy, sw - 12, color::WIN_BORDER);
+            }
+            let fg = if i == 4 {
+                color::TERM_AMBER
+            } else if i < WIN_COUNT && self.vis[i] == WindowVis::Open {
+                color::TERM_CYAN
+            } else {
+                color::TEXT_PRIMARY
+            };
+            self.fb.draw_str(sx + 12, iy + 10, label, fg, None);
+        }
+    }
+
+    fn taskbar_tab_geom(w: usize) -> (usize, usize, usize) {
+        let tab_w = if w >= 760 { 88 } else { 72 };
+        let gap = 6usize;
+        (80, tab_w, gap)
+    }
+
+    fn taskbar_tab_hit(&self, mx: usize, my: usize, w: usize, work_h: usize) -> Option<usize> {
+        let pill_y = work_h + 5;
+        let pill_h = 26;
+        if my < pill_y || my >= pill_y + pill_h {
+            return None;
+        }
+        let (mut tx, tab_w, gap) = Self::taskbar_tab_geom(w);
+        let tray_limit = w.saturating_sub(tray_width_for(w) + 12);
+
+        for idx in 0..WIN_COUNT {
+            if self.vis[idx] == WindowVis::Closed {
+                continue;
+            }
+            if tx + tab_w > tray_limit {
+                break;
+            }
+            if mx >= tx && mx < tx + tab_w {
+                return Some(idx);
+            }
+            tx += tab_w + gap;
+        }
+        None
     }
 
     fn redraw_taskbar(&mut self) {
@@ -313,72 +656,104 @@ impl DesktopState {
         // Start pill
         let pill_y = ty + 5;
         let pill_h = 26;
-        self.fb.fill_rect(8, pill_y, 64, pill_h, color::ACCENT);
-        self.fb.draw_rect_outline(8, pill_y, 64, pill_h, 1, color::ACCENT_BRIGHT);
-        self.fb.draw_str(24, pill_y + 9, "WMOS", color::TEXT_PRIMARY, None);
+        let pill_bg = if self.start_menu_open {
+            color::ACCENT_BRIGHT
+        } else {
+            color::ACCENT
+        };
+        self.fb
+            .fill_rect(START_PILL_X, pill_y, START_PILL_W, pill_h, pill_bg);
+        self.fb.draw_rect_outline(
+            START_PILL_X,
+            pill_y,
+            START_PILL_W,
+            pill_h,
+            1,
+            color::ACCENT_BRIGHT,
+        );
+        self.fb
+            .draw_str(START_PILL_X + 16, pill_y + 9, "WMOS", color::TEXT_PRIMARY, None);
 
-        // Window 0 tab
-        if TAB1_X + TAB1_W < w {
+        // Tabs for non-Closed windows
+        let (mut tx, tab_w, gap) = Self::taskbar_tab_geom(w);
+        let tray_limit = w.saturating_sub(tray_width_for(w) + 12);
+
+        for idx in 0..WIN_COUNT {
+            if self.vis[idx] == WindowVis::Closed {
+                continue;
+            }
+            if tx + tab_w > tray_limit {
+                break;
+            }
+            let active = self.vis[idx] == WindowVis::Open && self.wins[idx].active;
+            let minimized = self.vis[idx] == WindowVis::Minimized;
             draw_taskbar_tab(
                 &mut self.fb,
-                TAB1_X,
+                tx,
                 pill_y,
-                TAB1_W,
+                tab_w,
                 pill_h,
-                "[System Info]",
-                self.wins[0].active,
+                TAB_LABELS[idx],
+                active,
+                minimized,
             );
+            tx += tab_w + gap;
         }
 
-        // Window 1 tab
-        if TAB2_X + TAB2_W < w {
-            draw_taskbar_tab(
-                &mut self.fb,
-                TAB2_X,
-                pill_y,
-                TAB2_W,
-                pill_h,
-                "[WMOS Terminal]",
-                self.wins[1].active,
-            );
-        }
-
-        self.redraw_taskbar_tray(self.last_mouse_pos, pit::uptime_secs());
+        self.redraw_taskbar_tray(self.last_mouse_pos);
     }
 
-    fn redraw_taskbar_tray(&mut self, mouse_pos: (usize, usize), uptime_secs: u64) {
+    fn redraw_taskbar_tray(&mut self, mouse_pos: (usize, usize)) {
         let w = self.fb.width();
         let h = self.fb.height();
-        if h < TASKBAR_H || w <= TAB2_X + TAB2_W + 24 {
+        if h < TASKBAR_H {
             return;
         }
         let ty = h - TASKBAR_H;
         let pill_y = ty + 5;
         let pill_h = 26;
-        let tray_x = w.saturating_sub(TRAY_W + 8).max(TAB2_X + TAB2_W + 8);
+        let tray_w = tray_width_for(w);
+        let tray_x = w.saturating_sub(tray_w + 8);
         let clear_w = w.saturating_sub(tray_x);
 
-        self.fb.fill_rect(tray_x, pill_y, clear_w, pill_h, color::TASKBAR_BG);
+        self.fb
+            .fill_rect(tray_x, pill_y, clear_w, pill_h, color::TASKBAR_BG);
 
-        let hrs = uptime_secs / 3600;
-        let mins = (uptime_secs % 3600) / 60;
-        let secs = uptime_secs % 60;
-        let mut tray = StackBuf::<40>::new();
-        let _ = write!(
-            tray,
-            "UP {:02}:{:02}:{:02} | ({},{})",
-            hrs, mins, secs, mouse_pos.0, mouse_pos.1
-        );
+        let dt = rtc::read();
+        let mut tray = StackBuf::<44>::new();
+        if w >= 760 {
+            let _ = write!(
+                tray,
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} | ({},{})",
+                dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, mouse_pos.0, mouse_pos.1
+            );
+        } else {
+            let _ = write!(
+                tray,
+                "{:02}:{:02}:{:02} ({},{})",
+                dt.hour, dt.minute, dt.second, mouse_pos.0, mouse_pos.1
+            );
+        }
+
         let text_w = tray.as_str().len() * 8;
-        let draw_x = if w > text_w + 12 {
-            (w - text_w - 12).max(tray_x)
+        let draw_x = if w > text_w + 10 {
+            (w - text_w - 10).max(tray_x)
         } else {
             tray_x
         };
         let max_chars = w.saturating_sub(draw_x + 4) / 8;
         for (i, ch) in tray.as_str().chars().take(max_chars).enumerate() {
-            self.fb.draw_char(draw_x + i * 8, pill_y + 9, ch, color::TERM_CYAN, None);
+            self.fb
+                .draw_char(draw_x + i * 8, pill_y + 9, ch, color::TERM_CYAN, None);
         }
+    }
+}
+
+fn tray_width_for(w: usize) -> usize {
+    if w >= 760 {
+        252
+    } else {
+        152
     }
 }
 
@@ -390,6 +765,7 @@ fn draw_taskbar_tab(
     h: usize,
     label: &str,
     active: bool,
+    minimized: bool,
 ) {
     let bg = if active {
         color::TASKBAR_TAB_ACTIVE
@@ -403,6 +779,8 @@ fn draw_taskbar_tab(
     };
     let fg = if active {
         color::TEXT_PRIMARY
+    } else if minimized {
+        color::TERM_AMBER
     } else {
         color::TEXT_MUTED
     };
@@ -412,7 +790,9 @@ fn draw_taskbar_tab(
     if active {
         fb.draw_hline(x + 1, y + h - 2, w - 2, color::ACCENT_BRIGHT);
     }
-    fb.draw_str(x + 6, y + 9, label, fg, None);
+    let text_w = label.len() * 8;
+    let tx = x + w.saturating_sub(text_w) / 2;
+    fb.draw_str(tx, y + 9, label, fg, None);
 }
 
 fn render_desktop_header(fb: &mut Framebuffer, w: usize, work_h: usize) {
@@ -420,7 +800,7 @@ fn render_desktop_header(fb: &mut Framebuffer, w: usize, work_h: usize) {
         fb.draw_str(
             24,
             14,
-            "WMOS v1.0.0-mvp // x86_64 Framebuffer Desktop",
+            "WMOS v2.0.0 // x86_64 Double-Buffered Desktop",
             color::TEXT_MUTED,
             None,
         );
@@ -435,37 +815,39 @@ fn rects_overlap(a: &Window, b: &Window) -> bool {
     a.x < bx2 && ax2 > b.x && a.y < by2 && ay2 > b.y
 }
 
-fn compute_window_layout(w: usize, work_h: usize) -> (Window, Window) {
-    if w >= 780 {
+fn compute_initial_windows(
+    w: usize,
+    work_h: usize,
+) -> ([Window; WIN_COUNT], [(usize, usize, usize, usize); WIN_COUNT]) {
+    let (r0, r1, r2, r3) = if w >= 780 {
         let gap = if w >= 1000 { 24 } else { 16 };
         let side_margin = if w >= 1000 { 32 } else { 16 };
         let usable_w = w.saturating_sub(side_margin * 2 + gap);
         let left_w = ((usable_w * 46) / 100).clamp(320, 480);
-        let right_w = usable_w.saturating_sub(left_w).clamp(320, 560);
+        let right_w = usable_w.saturating_sub(left_w).clamp(320, 580);
         let total_pair_w = left_w + gap + right_w;
         let start_x = w.saturating_sub(total_pair_w) / 2;
 
         let top_min = if work_h >= 460 { 40 } else { 16 };
-        let win_h = work_h.saturating_sub(top_min + 20).clamp(240, 400);
+        let win_h = work_h.saturating_sub(top_min + 20).clamp(240, 430);
         let win_y = top_min + work_h.saturating_sub(top_min + win_h) / 3;
 
-        let sys_win = Window {
-            x: start_x,
-            y: win_y,
-            w: left_w,
-            h: win_h,
-            title: "System Info",
-            active: false,
-        };
-        let term_win = Window {
-            x: start_x + left_w + gap,
-            y: win_y,
-            w: right_w,
-            h: win_h,
-            title: "WMOS Terminal",
-            active: true,
-        };
-        (sys_win, term_win)
+        let pw = 400usize.min(w.saturating_sub(40));
+        let ph = 300usize.min(work_h.saturating_sub(32));
+        let px = (start_x + 48).min(w.saturating_sub(pw + 8));
+        let py = (win_y + 24).min(work_h.saturating_sub(ph + 8));
+
+        let nw = 430usize.min(w.saturating_sub(40));
+        let nh = 310usize.min(work_h.saturating_sub(32));
+        let nx = (start_x + 110).min(w.saturating_sub(nw + 8));
+        let ny = (win_y + 40).min(work_h.saturating_sub(nh + 8));
+
+        (
+            (start_x, win_y, left_w, win_h),
+            (start_x + left_w + gap, win_y, right_w, win_h),
+            (px, py, pw, ph),
+            (nx, ny, nw, nh),
+        )
     } else {
         let margin_x = 12usize.min(w / 16);
         let win_w = w.saturating_sub(margin_x * 2).max(160);
@@ -475,24 +857,53 @@ fn compute_window_layout(w: usize, work_h: usize) -> (Window, Window) {
         let top_h = ((avail_h * 52) / 100).max(120);
         let bot_h = avail_h.saturating_sub(top_h).max(100);
 
-        let sys_win = Window {
-            x: margin_x,
-            y: top_y,
-            w: win_w,
-            h: top_h,
+        let pw = w.saturating_sub(40).min(380);
+        let ph = work_h.saturating_sub(40).min(290);
+
+        (
+            (margin_x, top_y, win_w, top_h),
+            (margin_x, top_y + top_h + gap_y, win_w, bot_h),
+            (20, 20, pw, ph),
+            (28, 28, pw, ph),
+        )
+    };
+
+    let wins = [
+        Window {
+            x: r0.0,
+            y: r0.1,
+            w: r0.2,
+            h: r0.3,
             title: "System Info",
             active: false,
-        };
-        let term_win = Window {
-            x: margin_x,
-            y: top_y + top_h + gap_y,
-            w: win_w,
-            h: bot_h,
+        },
+        Window {
+            x: r1.0,
+            y: r1.1,
+            w: r1.2,
+            h: r1.3,
             title: "WMOS Terminal",
             active: true,
-        };
-        (sys_win, term_win)
-    }
+        },
+        Window {
+            x: r2.0,
+            y: r2.1,
+            w: r2.2,
+            h: r2.3,
+            title: "WMOS Paint",
+            active: false,
+        },
+        Window {
+            x: r3.0,
+            y: r3.1,
+            w: r3.2,
+            h: r3.3,
+            title: "WMOS Notepad",
+            active: false,
+        },
+    ];
+
+    (wins, [r0, r1, r2, r3])
 }
 
 fn draw_clipped_line(
@@ -528,51 +939,44 @@ fn render_system_info_content(
     let mut y = oy + pad_y;
     let max_w = win.w.saturating_sub(pad_x * 2 + 2);
     let max_y = win.y + win.h.saturating_sub(6);
-    let line_step = if win.h >= 340 { 16usize } else { 13usize };
+    let line_step = if win.h >= 380 { 16usize } else { 13usize };
 
     let mut line = StackBuf::<96>::new();
 
-    draw_clipped_line(fb, x, y, max_w, max_y, "OS      : wmos v1.0.0-mvp", color::TEXT_PRIMARY);
+    draw_clipped_line(fb, x, y, max_w, max_y, "OS      : wmos v2.0.0 (x86_64 no_std)", color::TEXT_PRIMARY);
     y += line_step;
 
-    draw_clipped_line(fb, x, y, max_w, max_y, "Arch    : x86_64 Rust no_std", color::TEXT_PRIMARY);
-    y += line_step;
-
+    let dt = rtc::read();
     let _ = write!(
         line,
-        "Limine  : rev {} | HHDM {:#x}",
-        summary.limine_revision, summary.hhdm_offset
+        "RTC     : {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
     );
-    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TEXT_MUTED);
+    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_CYAN);
     y += line_step;
 
     line.clear();
     let _ = write!(
         line,
-        "Display : {}x{} {}bpp (pitch {})",
-        summary.fb.width, summary.fb.height, summary.fb.bpp, summary.fb.pitch
+        "Display : {}x{} {}bpp | DB={} ({} KiB)",
+        summary.fb.width,
+        summary.fb.height,
+        summary.fb.bpp,
+        if fb.is_double_buffered() { "ON" } else { "OFF" },
+        fb.backbuffer_bytes() / 1024
     );
-    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_CYAN);
+    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TEXT_PRIMARY);
     y += line_step;
 
     let p = pmm::stats();
     let free_mib = (p.free_frames as u64 * PAGE_SIZE) / MIB;
     let total_mib = (p.total_frames as u64 * PAGE_SIZE) / MIB;
-    let pct = if p.total_frames > 0 {
-        ((p.free_frames as u128 * 100) / (p.total_frames as u128)) as u64
-    } else {
-        0
-    };
     line.clear();
-    let _ = write!(
-        line,
-        "PMM     : {} / {} MiB free ({}%)",
-        free_mib, total_mib, pct
-    );
+    let _ = write!(line, "PMM     : {} / {} MiB free", free_mib, total_mib);
     draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_GREEN);
     y += line_step;
 
-    let bar_h = 12usize;
+    let bar_h = 10usize;
     if y + bar_h <= max_y {
         draw_progress_bar(
             fb,
@@ -586,15 +990,55 @@ fn render_system_info_content(
             color::PROGRESS_BG,
             color::PROGRESS_BORDER,
         );
-        y += bar_h + 6;
+        y += bar_h + 5;
     }
 
-    let (vmm_text, vmm_col) = if vmm_ok {
-        ("VMM     : PASS (4-level paging)", color::TERM_GREEN)
-    } else {
-        ("VMM     : FAIL", color::DOT_RED)
-    };
-    draw_clipped_line(fb, x, y, max_w, max_y, vmm_text, vmm_col);
+    let hst = heap::stats();
+    line.clear();
+    let _ = write!(
+        line,
+        "Heap    : {}/{} KiB used ({} allocs)",
+        hst.used_bytes / 1024,
+        hst.total_bytes / 1024,
+        hst.alloc_count
+    );
+    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_CYAN);
+    y += line_step;
+
+    if y + bar_h <= max_y {
+        draw_progress_bar(
+            fb,
+            x,
+            y,
+            max_w.min(360),
+            bar_h,
+            hst.used_bytes as u64,
+            (hst.total_bytes as u64).max(1),
+            color::TERM_CYAN,
+            color::PROGRESS_BG,
+            color::PROGRESS_BORDER,
+        );
+        y += bar_h + 5;
+    }
+
+    let fst = fs::stats();
+    line.clear();
+    let _ = write!(
+        line,
+        "RAMFS   : {} files ({} B) | VMM {}",
+        fst.file_count,
+        fst.total_bytes,
+        if vmm_ok { "PASS" } else { "FAIL" }
+    );
+    draw_clipped_line(
+        fb,
+        x,
+        y,
+        max_w,
+        max_y,
+        line.as_str(),
+        if vmm_ok { color::TERM_GREEN } else { color::DOT_RED },
+    );
     y += line_step;
 
     let ticks = pit::ticks();
@@ -624,8 +1068,8 @@ fn render_system_info_content(
     line.clear();
     let _ = write!(
         line,
-        "Mouse   : ({}, {}) btn={:#x}",
-        mouse_pos.0, mouse_pos.1, mouse_buttons
+        "Mouse   : ({}, {}) btn={:#x} | Rev {}",
+        mouse_pos.0, mouse_pos.1, mouse_buttons, summary.limine_revision
     );
     draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TERM_CYAN);
     y += line_step + 2;
@@ -636,10 +1080,10 @@ fn render_system_info_content(
     }
 
     let checklist: [(&str, Color); 4] = [
-        ("[OK] Step 1: Limine boot + FB GUI", color::TERM_GREEN),
-        ("[OK] Step 2: GDT/TSS + IDT/PIC + Shell", color::TERM_GREEN),
-        ("[OK] Step 3: PMM bitmap + VMM 4-level", color::TERM_GREEN),
-        ("[OK] Step 4: PIT + PS/2 Mouse/KBD", color::TERM_GREEN),
+        ("[OK] Kernel: GDT/IDT/PIC/PMM/VMM/Heap", color::TERM_GREEN),
+        ("[OK] Hardware: PIT/RTC/PS2 KBD+Mouse", color::TERM_GREEN),
+        ("[OK] Storage: RAMFS + Notepad + Shell", color::TERM_GREEN),
+        ("[OK] Display: Double-Buf GUI + Paint", color::TERM_GREEN),
     ];
     for &(item, col) in &checklist {
         if y + 8 > max_y {
@@ -661,6 +1105,45 @@ fn terminal_pane_rect(win: &Window) -> Option<(usize, usize, usize, usize)> {
         None
     } else {
         Some((tx, ty, tw, th))
+    }
+}
+
+fn draw_prompt_line(
+    fb: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    max_w: usize,
+    max_y: usize,
+    term: &TerminalState,
+    blink_on: bool,
+) {
+    if y + 8 > max_y || max_w < 8 {
+        return;
+    }
+    let prefix = "wmos@kernel:~$ ";
+    let mut line_buf = StackBuf::<128>::new();
+    let _ = write!(line_buf, "{}{}", prefix, term.input_str());
+    draw_clipped_line(fb, x, y, max_w, max_y, line_buf.as_str(), color::TEXT_PRIMARY);
+
+    if blink_on {
+        let caret_col = prefix.len() + term.cursor_pos();
+        let caret_x = x + caret_col * 8;
+        if caret_x + 8 <= x + max_w {
+            let under = term
+                .input_str()
+                .as_bytes()
+                .get(term.cursor_pos())
+                .copied()
+                .map(|b| b as char)
+                .unwrap_or(' ');
+            fb.draw_char(
+                caret_x,
+                y,
+                under,
+                color::TERM_BG,
+                Some(color::TERM_CYAN),
+            );
+        }
     }
 }
 
@@ -696,9 +1179,7 @@ fn render_terminal_content(
         }
     }
 
-    let mut prompt_buf = StackBuf::<96>::new();
-    term.format_prompt(&mut prompt_buf, blink_on);
-    draw_clipped_line(fb, x, y, max_w, max_y, prompt_buf.as_str(), color::TEXT_PRIMARY);
+    draw_prompt_line(fb, x, y, max_w, max_y, term, blink_on);
 }
 
 fn render_terminal_prompt_only(
@@ -721,12 +1202,10 @@ fn render_terminal_prompt_only(
     let shown = term.line_count().min(max_history_rows);
     let y = y0 + shown * line_step;
 
-    if y + 8 > max_y || max_w < 8 {
+    if y + 10 > max_y || max_w < 8 {
         return;
     }
 
     fb.fill_rect(x, y, max_w, 10, color::TERM_BG);
-    let mut prompt_buf = StackBuf::<96>::new();
-    term.format_prompt(&mut prompt_buf, blink_on);
-    draw_clipped_line(fb, x, y, max_w, max_y, prompt_buf.as_str(), color::TEXT_PRIMARY);
+    draw_prompt_line(fb, x, y, max_w, max_y, term, blink_on);
 }
