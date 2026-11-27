@@ -5,10 +5,11 @@ use alloc::vec::Vec;
 use crate::arch::{cpu, pit, rtc};
 use crate::boot_info::BootSummary;
 use crate::drivers::keyboard::{self, KeyEvent};
-use crate::drivers::{ahci, mouse, pci};
+use crate::drivers::{ahci, e1000, mouse, pci};
 use crate::fs;
 use crate::gfx::color::{self, Color, Theme};
 use crate::mem::{heap, pmm, vmm};
+use crate::net;
 use crate::task::{self, TaskState};
 
 const MAX_LINES: usize = 64;
@@ -17,10 +18,10 @@ const MAX_INPUT_LEN: usize = 96;
 const MIB: u64 = 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
-const COMMANDS: [&str; 22] = [
+const COMMANDS: [&str; 25] = [
     "help", "info", "mem", "date", "uptime", "ls", "cat", "write", "append", "touch", "rm",
-    "stat", "open", "lspci", "ps", "disks", "theme", "echo", "clear", "about", "reboot",
-    "poweroff",
+    "stat", "open", "lspci", "ps", "disks", "ifconfig", "ping", "udp", "theme", "echo", "clear",
+    "about", "reboot", "poweroff",
 ];
 
 const APP_NAMES: [&str; 5] = ["info", "term", "paint", "notepad", "files"];
@@ -293,6 +294,10 @@ impl TerminalState {
                 color::TERM_CYAN,
             );
             self.push_line(
+                "Net : ifconfig, ping [ip], udp <ip> <port> <msg>",
+                color::TERM_CYAN,
+            );
+            self.push_line(
                 "FS  : ls [/disk], cat/write/append/touch/rm/stat <f> (/disk/<8.3> RW)",
                 color::TERM_GREEN,
             );
@@ -302,7 +307,7 @@ impl TerminalState {
             );
         } else if cmd == "info" {
             self.push_line(
-                "OS: wmos v4.0.0 | Arch: x86_64 (Rust no_std)",
+                "OS: wmos v4.1.0 | Arch: x86_64 (Rust no_std)",
                 color::TEXT_PRIMARY,
             );
             self.push_line(
@@ -598,6 +603,140 @@ impl TerminalState {
             } else {
                 self.push_line("Unknown theme. Use: theme <dark|ocean|amber>", color::TERM_AMBER);
             }
+        } else if cmd == "ifconfig" {
+            if let Some(nic) = e1000::info() {
+                let cfg = net::config();
+                let (tx, rx) = e1000::stats();
+                self.push_line(
+                    &format!(
+                        "e1000 {:04x}:{:04x} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        nic.vendor_id,
+                        nic.device_id,
+                        nic.mac[0],
+                        nic.mac[1],
+                        nic.mac[2],
+                        nic.mac[3],
+                        nic.mac[4],
+                        nic.mac[5]
+                    ),
+                    color::TERM_CYAN,
+                );
+                self.push_line(
+                    &format!(
+                        "IPv4: {}.{}.{}.{}/24  GW: {}.{}.{}.{}  ({})",
+                        cfg.ip[0],
+                        cfg.ip[1],
+                        cfg.ip[2],
+                        cfg.ip[3],
+                        cfg.gateway[0],
+                        cfg.gateway[1],
+                        cfg.gateway[2],
+                        cfg.gateway[3],
+                        if net::is_up() { "UP" } else { "DOWN" }
+                    ),
+                    color::TERM_GREEN,
+                );
+                self.push_line(&format!("Stats: TX={} packets  RX={} packets", tx, rx), color::TEXT_PRIMARY);
+            } else {
+                self.push_line("No e1000 NIC detected", color::TERM_AMBER);
+            }
+        } else if cmd == "ping" || cmd.starts_with("ping ") {
+            if !net::is_up() {
+                self.push_line("Network interface is down", color::DOT_RED);
+            } else {
+                let target = if cmd == "ping" {
+                    Some([10, 0, 2, 2])
+                } else {
+                    cmd.strip_prefix("ping ").and_then(|s| net::parse_ipv4(s.trim()))
+                };
+                match target {
+                    Some(ip) => {
+                        let mut logged = false;
+                        for seq in 1u16..=3 {
+                            match net::ping(ip, seq) {
+                                Ok(rtt_ms) => {
+                                    if !logged {
+                                        logged = true;
+                                        crate::serial_println!(
+                                            "[wmos] ping {}.{}.{}.{} ok rtt={}ms",
+                                            ip[0],
+                                            ip[1],
+                                            ip[2],
+                                            ip[3],
+                                            rtt_ms
+                                        );
+                                    }
+                                    self.push_line(
+                                        &format!(
+                                            "Reply from {}.{}.{}.{}: seq={} time={}ms",
+                                            ip[0], ip[1], ip[2], ip[3], seq, rtt_ms
+                                        ),
+                                        color::TERM_GREEN,
+                                    );
+                                }
+                                Err(err) => {
+                                    self.push_line(
+                                        &format!("Probe seq={}: {}", seq, err),
+                                        color::TERM_AMBER,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        self.push_line("Invalid IPv4 address. Usage: ping [ip]", color::DOT_RED);
+                    }
+                }
+            }
+        } else if cmd == "udp" {
+            self.push_line("Usage: udp <ip> <port> <msg>", color::TERM_AMBER);
+        } else if let Some(rest) = cmd.strip_prefix("udp ") {
+            if !net::is_up() {
+                self.push_line("Network interface is down", color::DOT_RED);
+            } else {
+                let trimmed = rest.trim_start();
+                let mut parsed = None;
+                if let Some((ip_s, after_ip)) = trimmed.split_once(' ') {
+                    let after_ip = after_ip.trim_start();
+                    if let Some((port_s, msg)) = after_ip.split_once(' ') {
+                        if let (Some(ip), Ok(port)) =
+                            (net::parse_ipv4(ip_s.trim()), port_s.trim().parse::<u16>())
+                        {
+                            parsed = Some((ip, port, msg.trim_start()));
+                        }
+                    }
+                }
+                match parsed {
+                    Some((ip, port, msg)) => match net::send_udp(ip, 40000, port, msg.as_bytes()) {
+                        Ok(()) => {
+                            crate::serial_println!(
+                                "[wmos] udp sent {}.{}.{}.{}:{}",
+                                ip[0],
+                                ip[1],
+                                ip[2],
+                                ip[3],
+                                port
+                            );
+                            self.push_line(
+                                &format!(
+                                    "Sent {} B UDP -> {}.{}.{}.{}:{}",
+                                    msg.len(),
+                                    ip[0],
+                                    ip[1],
+                                    ip[2],
+                                    ip[3],
+                                    port
+                                ),
+                                color::TERM_GREEN,
+                            );
+                        }
+                        Err(e) => self.push_line(e, color::DOT_RED),
+                    },
+                    None => {
+                        self.push_line("Usage: udp <ip> <port> <msg>", color::TERM_AMBER);
+                    }
+                }
+            }
         } else if cmd == "echo" {
             self.push_line("", color::TEXT_PRIMARY);
         } else if let Some(rest) = cmd.strip_prefix("echo ") {
@@ -606,11 +745,11 @@ impl TerminalState {
             self.lines.clear();
         } else if cmd == "about" {
             self.push_line(
-                "wmos v4.0.0 - Minimal x86_64 Rust no_std OS",
+                "wmos v4.1.0 - Minimal x86_64 Rust no_std OS",
                 color::TERM_CYAN,
             );
             self.push_line(
-                "GDT/IDT/PMM/VMM/Heap + PCI/AHCI/FAT32 + Scheduler + Double-Buf GUI",
+                "GDT/IDT/PMM/VMM/Heap + PCI/AHCI/FAT32 + e1000/Net + Double-Buf GUI",
                 color::TEXT_MUTED,
             );
         } else if cmd == "reboot" {

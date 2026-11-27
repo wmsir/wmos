@@ -12,7 +12,7 @@ fi
 
 rm -f dist/qemu-bios.log dist/qemu-uefi.log dist/qemu-uefi-reboot.log dist/wmos-persist-test.img dist/boot-preview.ppm dist/boot-preview.png /tmp/wmos-mon.sock
 
-echo "=== [1/2] Verifying dist/wmos.iso in QEMU Legacy BIOS mode ==="
+echo "=== [1/3] Verifying dist/wmos.iso in QEMU Legacy BIOS mode ==="
 set +e
 timeout 12s qemu-system-x86_64 \
     -M q35 \
@@ -34,7 +34,7 @@ if [[ ${bios_rc} -ne 0 && ${bios_rc} -ne 124 ]]; then
     exit 1
 fi
 
-echo "=== [2/3] Verifying dist/wmos.iso + FAT32 disk write in QEMU UEFI (OVMF) Boot #1 ==="
+echo "=== [2/3] Verifying dist/wmos.iso + FAT32 disk write + e1000 net in QEMU UEFI (OVMF) Boot #1 ==="
 OVMF_CANDIDATES=(
     "/usr/share/OVMF/OVMF_CODE_4M.fd"
     "/usr/share/OVMF/OVMF_CODE.fd"
@@ -79,6 +79,8 @@ qemu-system-x86_64 \
     -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
     -cdrom dist/wmos.iso \
     -drive "file=dist/wmos-persist-test.img,format=raw" \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
     -vga std \
     -display none \
     -serial file:dist/qemu-uefi.log \
@@ -165,17 +167,20 @@ if os.path.exists(sock_path):
             "write demo.txt hello",
             "cat demo.txt",
             "write /disk/persist.txt hello-v4",
+            "ifconfig",
+            "ping 10.0.2.2",
             "open files",
         ):
             send_command(s, cmd)
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             if os.path.exists(uefi_log_path):
                 with open(uefi_log_path, "r", encoding="utf-8", errors="replace") as lf:
                     content = lf.read()
                     if (
                         "[wmos] fs disk write disk/persist.txt ok" in content
+                        and "[wmos] ping 10.0.2.2 ok" in content
                         and "[wmos] cmd: open files" in content
                     ):
                         break
@@ -320,6 +325,8 @@ assert_log "dist/qemu-uefi.log" "UEFI"
 for uefi_marker in \
     "[wmos] ahci ok disks=1" \
     "[wmos] disk fat32 ok" \
+    "[wmos] e1000 ok mac=" \
+    "[wmos] net ok ip=10.0.2.15" \
     "[wmos] mouse active" \
     "[wmos] cmd: lspci" \
     "[wmos] cmd: ps" \
@@ -330,6 +337,9 @@ for uefi_marker in \
     "[wmos] fs cat demo.txt ok" \
     "[wmos] cmd: write /disk/persist.txt hello-v4" \
     "[wmos] fs disk write disk/persist.txt ok" \
+    "[wmos] cmd: ifconfig" \
+    "[wmos] cmd: ping 10.0.2.2" \
+    "[wmos] ping 10.0.2.2 ok" \
     "[wmos] cmd: open files"
 do
     if ! grep -qF "${uefi_marker}" "dist/qemu-uefi.log"; then
@@ -448,7 +458,7 @@ fi
 
 echo "=== Verification Summary ==="
 echo "BIOS log: PASSED (all 17 required markers present, no PANIC/EXCEPTION)"
-echo "UEFI Boot #1 log: PASSED (all 17 + interactive + FAT32 disk write markers present)"
+echo "UEFI Boot #1 log: PASSED (all 17 + interactive + FAT32 disk write + e1000/ping markers present)"
 echo "mtools check: PASSED (::/PERSIST.TXT contains 'hello-v4')"
 echo "UEFI Boot #2 (cold reboot): PASSED ('[wmos] fs cat disk/persist.txt ok', no PANIC/EXCEPTION)"
 if [[ -f dist/boot-preview.png ]]; then

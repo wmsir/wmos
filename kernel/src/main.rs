@@ -9,6 +9,7 @@ mod drivers;
 mod fs;
 mod gfx;
 mod mem;
+mod net;
 mod shell;
 mod task;
 
@@ -146,6 +147,22 @@ pub extern "C" fn kmain() -> ! {
     assert!(task::total_switches() >= 2, "Scheduler self-test failed");
     serial_println!("[wmos] sched ok tasks={}", task::list().len());
 
+    if let Some(nic) = drivers::e1000::init() {
+        serial_println!(
+            "[wmos] e1000 ok mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            nic.mac[0], nic.mac[1], nic.mac[2], nic.mac[3], nic.mac[4], nic.mac[5]
+        );
+        net::init();
+        let cfg = net::config();
+        serial_println!(
+            "[wmos] net ok ip={}.{}.{}.{} gw={}.{}.{}.{}",
+            cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3],
+            cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3]
+        );
+    } else {
+        serial_println!("[wmos] e1000 skipped");
+    }
+
     arch::pit::init();
     drivers::mouse::set_bounds(summary.fb.width, summary.fb.height);
     drivers::ps2::init();
@@ -178,6 +195,9 @@ pub extern "C" fn kmain() -> ! {
 
     let mut last_ui_tick = arch::pit::ticks();
     loop {
+        if net::is_up() {
+            net::poll();
+        }
         while let Some(ev) = drivers::keyboard::pop_event() {
             desktop.handle_key(ev);
         }

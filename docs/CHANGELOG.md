@@ -1,6 +1,6 @@
 # WMOS 变更日志 (CHANGELOG)
 
-记录 WMOS 从初始引导原型到 `v4.0.0` 及后续演进的全部里程碑与代码级变更。
+记录 WMOS 从初始引导原型到 `v4.1.0` 及后续演进的全部里程碑与代码级变更。
 
 ---
 
@@ -18,7 +18,29 @@
 
 ---
 
+## [v4.1.0] - 2026-11-27
+
+- **变更类型**：`feat` / `ci` / `docs`
+- **改动文件**：
+  - PCI 与 Intel e1000 驱动：`kernel/src/drivers/pci.rs`、`kernel/src/drivers/mod.rs`、`kernel/src/drivers/e1000.rs`
+  - 网络协议栈与主循环：`kernel/src/net/mod.rs`、`kernel/src/main.rs`
+  - 终端网络命令与桌面监控：`kernel/src/shell.rs`、`kernel/src/gfx/desktop.rs`
+  - CI 网络验证与文档：`scripts/verify-qemu.sh`、`docs/DESIGN.md`、`docs/CHANGELOG.md`、`README.md`
+- **变更摘要**：
+  - **PCI `bar0` 扩展 (`drivers/pci.rs`)**：`PciDevice` 新增 `pub bar0: u32`（读取配置空间偏移 `0x10`）。
+  - **Intel e1000/e1000e DMA 驱动 (`drivers/e1000.rs`)**：识别 Intel `0x8086`（`0x100E`/`0x10D3`/`0x100F`/`0x1004`），开启 Memory Space + Bus Master (`0x04 |= 0x06`)，将 `bar0 & !0xFFF` 共 `32` 页（`128 KiB`）以非缓存属性映射至 `E1000_MMIO_VIRT (0xFFFF_B001_0000_0000)`；屏蔽中断、置位 `SLU`、读取 `RAL0`/`RAH0` 或 `EERD` EEPROM MAC 地址，并基于 PMM 物理帧建立 `16` 槽 `RxDesc` / `TxDesc` 环形缓冲区与 `2048 B` 收发缓冲，提供 `init`、`info`、`send_frame`、`poll_recv` 与 `stats`。
+  - **IPv4/ARP/ICMP/UDP 协议栈 (`net/mod.rs` & `main.rs`)**：默认配置静态 QEMU SLIRP 地址 `10.0.2.15/24`（网关 `10.0.2.2`）；实现 RFC 1071 校验和、`ARP_CACHE_SIZE = 16` 缓存及解析重试、`ICMP_ECHO_ID = 0x574D` Echo 请求/回复（含自动响应入站 ARP/ICMP Echo）以及最大 `1472 B` 载荷 `send_udp`；`kmain` 输出 `[wmos] e1000 ok mac=<mac>`、`[wmos] net ok ip=<ip> gw=<gw>`（无网卡时输出 `[wmos] e1000 skipped`）并在事件循环每轮执行 `net::poll()`。
+  - **Shell 网络命令与 `System Info` 集成 (`shell.rs` & `gfx/desktop.rs`)**：终端扩展至 `25` 条命令，新增 `ifconfig`、`ping [ip]`（发送 3 次 ICMP 探测并输出 `[wmos] ping <ip> ok rtt=<ms>ms`）与 `udp <ip> <port> <msg>`（输出 `[wmos] udp sent <ip>:<port>`）；桌面顶栏与 `System Info` 升级至 `wmos v4.1.0` 并实时展示 `Net` IPv4 与 TX/RX 包统计。
+  - **CI e1000 + `ping` 闭环验证 (`scripts/verify-qemu.sh`)**：UEFI Boot #1 挂载 `-netdev user,id=net0 -device e1000,netdev=net0`，注入 `ifconfig` 与 `ping 10.0.2.2` 并严格断言 `[wmos] e1000 ok mac=`、`[wmos] net ok ip=10.0.2.15`、`[wmos] cmd: ifconfig`、`[wmos] cmd: ping 10.0.2.2` 及 `[wmos] ping 10.0.2.2 ok`，完整保留 BIOS、FAT32 写入、`mtype` 与 Boot #2 冷重启检查。
+- **验证结果**：
+  - 本地 `cargo +stable-x86_64-pc-windows-gnu clean && cargo +stable-x86_64-pc-windows-gnu build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `392184` B，`e_entry=0xffffffff80024ab0`），`scripts/*.sh` 纯 LF 与零禁用标记检查通过。
+  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端 BIOS/UEFI + SATA 持久化 + e1000 网络交互验证。
+
+---
+
 ## [v4.0.0] - 2026-11-27
+
+### `2c01a9d` — AHCI DMA 写入、FAT32 根目录 `/disk/<8.3>` 持久化与冷重启 CI 校验
 
 - **变更类型**：`feat` / `ci` / `docs`
 - **改动文件**：
@@ -31,8 +53,7 @@
   - **GUI 与 Shell 可写 `/disk/` 集成 (`gfx/{apps,desktop}.rs` & `shell.rs`)**：`NotepadApp` 通过 `is_disk_readonly_path` 放行根目录 `/disk/<8.3>` 保存且在写入失败时显示 `Error`；`FilesApp` 支持删除根目录 `/disk/<8.3>` 磁盘文件并显示 `FAT32 RW` / `Protected` / `RAMFS` 状态；桌面顶栏、`System Info` 与终端 `help`/`info`/`about` 升级至 `wmos v4.0.0`，支持 `write`/`append`/`touch`/`rm` 操作 `/disk/<8.3>`。
   - **CI 持久化与冷重启闭环验证 (`scripts/verify-qemu.sh`)**：UEFI Boot #1 挂载副本镜像 `dist/wmos-persist-test.img` 注入 `write /disk/persist.txt hello-v4`；宿主 `mtype -i dist/wmos-persist-test.img@@2M ::/PERSIST.TXT` 验证 `hello-v4` 落盘；UEFI Boot #2 冷重启挂载同一镜像注入 `cat /disk/persist.txt` 并断言 `[wmos] fs cat disk/persist.txt ok`。
 - **验证结果**：
-  - 本地 `cargo build --release`（inside `kernel/`）：0 errors, 0 warnings（ELF64 `369304` B），`scripts/*.sh` 纯 LF（0 `\r` 字节）与零禁用标记检查通过。
-  - 待提交推送后由 GitHub Actions `Build and Verify WMOS` 执行云端 BIOS/UEFI + 持久化冷重启验证。
+  - GitHub Actions Run [`45989950613`](https://github.com/wmsir/wmos/actions/runs/45989950613) 全绿通过（BIOS + UEFI Boot #1 写入 `/disk/persist.txt` + `mtype ::/PERSIST.TXT => hello-v4` + UEFI Boot #2 冷重启读取 `[wmos] fs cat disk/persist.txt ok` 全部通过，产出 `wmos-images` `3517455` B 与 `wmos-ci-logs-and-preview` `17962` B）。
 
 ---
 

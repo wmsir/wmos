@@ -23,6 +23,7 @@ pub struct PciDevice {
     pub header_type: u8,
     #[allow(dead_code)]
     pub irq_line: u8,
+    pub bar0: u32,
     pub bar5: u32,
 }
 
@@ -120,7 +121,13 @@ fn read_device(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
     let reg0c = read_u32(bus, dev, func, 0x0C);
     let header_type = ((reg0c >> 16) & 0xFF) as u8;
 
-    let bar5 = if (header_type & 0x7F) == 0 {
+    let is_type0 = (header_type & 0x7F) == 0;
+    let bar0 = if is_type0 {
+        read_u32(bus, dev, func, 0x10)
+    } else {
+        0
+    };
+    let bar5 = if is_type0 {
         read_u32(bus, dev, func, 0x24)
     } else {
         0
@@ -140,6 +147,7 @@ fn read_device(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
         prog_if,
         header_type,
         irq_line,
+        bar0,
         bar5,
     })
 }

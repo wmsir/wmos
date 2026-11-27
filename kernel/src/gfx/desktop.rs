@@ -3,7 +3,7 @@ use core::fmt::Write;
 use crate::arch::{cpu, pit, rtc};
 use crate::boot_info::BootSummary;
 use crate::drivers::keyboard::{self, KeyEvent};
-use crate::drivers::{mouse, pci};
+use crate::drivers::{e1000, mouse, pci};
 use crate::drivers::mouse::MouseState;
 use crate::fs;
 use crate::gfx::apps::{FilesAction, FilesApp, NotepadApp, PaintApp};
@@ -14,6 +14,7 @@ use crate::gfx::ui::{
     WindowButton,
 };
 use crate::mem::{heap, pmm};
+use crate::net;
 use crate::shell::{ShellAction, TerminalState};
 use crate::task;
 
@@ -929,7 +930,7 @@ fn render_desktop_header(fb: &mut Framebuffer, w: usize, work_h: usize) {
         fb.draw_str(
             24,
             14,
-            "WMOS v4.0.0 // x86_64 PCI + AHCI FAT32 RW + Multitask Desktop",
+            "WMOS v4.1.0 // x86_64 AHCI FAT32 RW + e1000 Net + Desktop",
             color::TEXT_MUTED,
             None,
         );
@@ -1095,7 +1096,7 @@ fn render_system_info_content(
         y,
         max_w,
         max_y,
-        "OS      : wmos v4.0.0 (x86_64 no_std)",
+        "OS      : wmos v4.1.0 (x86_64 no_std)",
         color::TEXT_PRIMARY,
     );
     y += line_step;
@@ -1199,6 +1200,26 @@ fn render_system_info_content(
     draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), color::TEXT_PRIMARY);
     y += line_step;
 
+    line.clear();
+    let net_col = if net::is_up() {
+        let cfg = net::config();
+        let (tx, rx) = e1000::stats();
+        let _ = write!(
+            line,
+            "Net     : {}.{}.{}.{} (TX {} / RX {})",
+            cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3], tx, rx
+        );
+        color::TERM_GREEN
+    } else if e1000::info().is_some() {
+        let _ = write!(line, "Net     : e1000 down");
+        color::TERM_AMBER
+    } else {
+        let _ = write!(line, "Net     : offline");
+        color::TEXT_MUTED
+    };
+    draw_clipped_line(fb, x, y, max_w, max_y, line.as_str(), net_col);
+    y += line_step;
+
     let ticks = pit::ticks();
     let secs = pit::uptime_secs();
     line.clear();
@@ -1234,9 +1255,9 @@ fn render_system_info_content(
 
     let checklist: [(&str, Color); 4] = [
         ("[OK] Kernel : GDT/IDT/PIC/PMM/VMM/Heap", color::TERM_GREEN),
-        ("[OK] Drivers: PCI/AHCI/RTC/PIT/PS2", color::TERM_GREEN),
-        ("[OK] Storage: RAMFS + FAT32 + Files", color::TERM_GREEN),
-        ("[OK] Desktop: Double-Buf + Sched + Apps", color::TERM_GREEN),
+        ("[OK] Drivers: PCI/AHCI/e1000/RTC/PS2", color::TERM_GREEN),
+        ("[OK] Storage: RAMFS + FAT32 RW + Files", color::TERM_GREEN),
+        ("[OK] Desktop: Double-Buf + Sched + Net", color::TERM_GREEN),
     ];
     for &(item, col) in &checklist {
         if y + 8 > max_y {
